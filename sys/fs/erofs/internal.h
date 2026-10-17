@@ -109,8 +109,10 @@ void erofs_log_err(const struct erofs_sb_info *sbi, const char *func,
     const char *fmt, ...) __printflike(3, 4);
 int erofs_log_corrupt(const struct erofs_sb_info *sbi, uint64_t nid,
     const char *func, int line, const char *fmt, ...) __printflike(5, 6);
+struct erofs_device_info;
 
 typedef uint64_t erofs_nid_t;
+typedef uint64_t erofs_off_t;
 
 #if !defined(__BYTE_ORDER__) || !defined(__ORDER_LITTLE_ENDIAN__)
 #error EROFS requires compiler byte-order definitions
@@ -142,14 +144,30 @@ _Static_assert(PAGE_SHIFT <= 16, "EROFS block sizes are at most 64 KiB");
 #define EROFS_MOUNT_POSIX_ACL  0x00000020
 #define EROFS_MOUNT_XATTR_USER 0x00000080
 #define EROFS_MOUNT_DIRECT_IO  0x00000100
+#define test_opt(opt, option)  ((opt)->mount_opt & EROFS_MOUNT_##option)
+
+struct erofs_sb_info_opts {
+	unsigned int mount_opt;
+};
+
+struct erofs_device_info {
+	struct vnode *devvp;
+	struct ucred *source_cred;
+};
 
 struct erofs_sb_info {
 	struct mount *mnt;
+
+	struct erofs_sb_info_opts opt;
 };
 
 struct erofs_inode {
 	erofs_nid_t nid;
 	__enum_uint8(vtype) vtype;
 };
+
+/* File-backed source I/O is owned by fileio.c. */
+int erofs_read_file_source(struct erofs_sb_info *sbi,
+    struct erofs_device_info *dif, erofs_off_t off, size_t len, void *out);
 
 #endif /* _FS_EROFS_INTERNAL_H_ */
