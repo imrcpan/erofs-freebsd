@@ -86,6 +86,8 @@ _Static_assert(__builtin_offsetof(struct erofs_deviceslot, blocks_hi) == 72,
 _Static_assert(__builtin_offsetof(struct erofs_deviceslot, uniaddr_hi) == 74,
     "EROFS device unified address high ABI offset");
 
+typedef uint64_t erofs_nid_t;
+
 #if !defined(__BYTE_ORDER__) || !defined(__ORDER_LITTLE_ENDIAN__)
 #error EROFS requires compiler byte-order definitions
 #elif __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
@@ -116,5 +118,10 @@ _Static_assert(PAGE_SHIFT <= 16, "EROFS block sizes are at most 64 KiB");
 #define EROFS_MOUNT_POSIX_ACL  0x00000020
 #define EROFS_MOUNT_XATTR_USER 0x00000080
 #define EROFS_MOUNT_DIRECT_IO  0x00000100
+
+struct erofs_inode {
+	erofs_nid_t nid;
+	__enum_uint8(vtype) vtype;
+};
 
 #endif /* _FS_EROFS_INTERNAL_H_ */
