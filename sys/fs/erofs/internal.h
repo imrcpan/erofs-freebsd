@@ -86,6 +86,30 @@ _Static_assert(__builtin_offsetof(struct erofs_deviceslot, blocks_hi) == 72,
 _Static_assert(__builtin_offsetof(struct erofs_deviceslot, uniaddr_hi) == 74,
     "EROFS device unified address high ABI offset");
 
+MALLOC_DECLARE(M_EROFS);
+
+/*
+ * Diagnostics.  erofs_corrupt() goes where bad on-disk data is first
+ * noticed, not in the callers that pass the error up.  It logs one
+ * rate-limited line (mount point, function, what was wrong, inode), fires
+ * the erofs:::corrupt DTrace probe (arguments: nid, source line, error)
+ * and returns EINTEGRITY, so a check reads
+ *
+ *	return (erofs_corrupt(sbi, nid, "bad foo %u", foo));
+ *
+ * erofs_err() is the same without the probe, for errors that are not
+ * corruption, such as an unsupported feature.
+ */
+struct erofs_sb_info;
+/* The error is not about an inode. */
+/* clang-format off */
+#define EROFS_NID_NONE	((erofs_nid_t)-1)
+/* clang-format on */
+void erofs_log_err(const struct erofs_sb_info *sbi, const char *func,
+    const char *fmt, ...) __printflike(3, 4);
+int erofs_log_corrupt(const struct erofs_sb_info *sbi, uint64_t nid,
+    const char *func, int line, const char *fmt, ...) __printflike(5, 6);
+
 typedef uint64_t erofs_nid_t;
 
 #if !defined(__BYTE_ORDER__) || !defined(__ORDER_LITTLE_ENDIAN__)
@@ -118,6 +142,10 @@ _Static_assert(PAGE_SHIFT <= 16, "EROFS block sizes are at most 64 KiB");
 #define EROFS_MOUNT_POSIX_ACL  0x00000020
 #define EROFS_MOUNT_XATTR_USER 0x00000080
 #define EROFS_MOUNT_DIRECT_IO  0x00000100
+
+struct erofs_sb_info {
+	struct mount *mnt;
+};
 
 struct erofs_inode {
 	erofs_nid_t nid;
