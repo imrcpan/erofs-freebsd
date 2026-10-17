@@ -109,10 +109,13 @@ void erofs_log_err(const struct erofs_sb_info *sbi, const char *func,
     const char *fmt, ...) __printflike(3, 4);
 int erofs_log_corrupt(const struct erofs_sb_info *sbi, uint64_t nid,
     const char *func, int line, const char *fmt, ...) __printflike(5, 6);
+#define erofs_corrupt(sbi, nid, fmt, ...) \
+	erofs_log_corrupt((sbi), (nid), __func__, __LINE__, fmt, ##__VA_ARGS__)
 struct erofs_device_info;
 
 typedef uint64_t erofs_nid_t;
 typedef uint64_t erofs_off_t;
+typedef uint64_t erofs_blk_t;
 
 #if !defined(__BYTE_ORDER__) || !defined(__ORDER_LITTLE_ENDIAN__)
 #error EROFS requires compiler byte-order definitions
@@ -150,21 +153,90 @@ struct erofs_sb_info_opts {
 	unsigned int mount_opt;
 };
 
+struct erofs_device_handle;
+
+enum erofs_source_kind {
+	EROFS_SOURCE_NONE,
+	EROFS_SOURCE_BLOCK,
+	EROFS_SOURCE_FILE,
+};
+
 struct erofs_device_info {
 	struct vnode *devvp;
+	struct erofs_device_handle *handle;
 	struct ucred *source_cred;
+	enum erofs_source_kind source_kind;
+	uint64_t mediasize;
+	uint32_t sectorsize;
+	uint64_t fsoff;
+
+	erofs_blk_t blocks;
 };
+
+static inline bool
+erofs_source_is_open(const struct erofs_device_info *dif)
+{
+	return (dif != NULL && dif->devvp != NULL && dif->handle != NULL &&
+	    (dif->source_kind == EROFS_SOURCE_BLOCK ||
+		dif->source_kind == EROFS_SOURCE_FILE));
+}
+
+static inline bool
+erofs_source_is_file(const struct erofs_device_info *dif)
+{
+	return (
+	    erofs_source_is_open(dif) && dif->source_kind == EROFS_SOURCE_FILE);
+}
 
 struct erofs_sb_info {
 	struct mount *mnt;
+	struct erofs_device_info dif0;
+
+	uint32_t block_size;
+	uint8_t blkszbits;
+	struct erofs_inode *metabox_en;
+	erofs_blk_t blocks;
+	uint32_t feature_compat;
+	uint32_t feature_incompat;
 
 	struct erofs_sb_info_opts opt;
 };
+
+#define EROFS_FEATURE_FUNCS(name, compat, feature)                           \
+	static inline bool erofs_sb_has_##name(                              \
+	    const struct erofs_sb_info *sbi)                                 \
+	{                                                                    \
+		return (                                                     \
+		    (sbi->feature_##compat & EROFS_FEATURE_##feature) != 0); \
+	}
+EROFS_FEATURE_FUNCS(metabox, incompat, INCOMPAT_METABOX)
 
 struct erofs_inode {
 	erofs_nid_t nid;
 	__enum_uint8(vtype) vtype;
 };
+
+static inline bool
+erofs_nid_in_metabox(erofs_nid_t nid)
+{
+	return ((nid & BIT_ULL(EROFS_DIRENT_NID_METABOX_BIT)) != 0);
+}
+
+struct erofs_buf {
+	void *data;
+	void (*release)(void *);
+};
+
+/* Buffer and device I/O. */
+void erofs_put_metabuf(struct erofs_buf *buf);
+int erofs_bread(struct erofs_sb_info *sbi, erofs_off_t off, size_t len,
+    void **bufp);
+void erofs_brelse(void *buf);
+int erofs_read_metadata_range(struct erofs_sb_info *sbi, erofs_nid_t nid,
+    erofs_off_t off, size_t len, struct erofs_buf *buf);
+/* Logical mapping and file data. */
+int erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t loff, size_t len, void **bufp);
 
 /* File-backed source I/O is owned by fileio.c. */
 int erofs_read_file_source(struct erofs_sb_info *sbi,
