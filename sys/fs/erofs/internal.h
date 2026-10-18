@@ -303,6 +303,9 @@ struct erofs_inode {
 	uint32_t xattr_isize;
 	bool compact_inode;
 	bool dot_omitted;
+	/* Compression fields */
+	uint16_t z_advise;
+	uint8_t z_lclusterbits;
 	/* Chunk-based fields */
 	uint16_t chunkformat;
 	uint8_t chunkbits;
@@ -341,8 +344,10 @@ erofs_nid_to_ino64(const struct erofs_sb_info *sbi, erofs_nid_t nid)
 /* Allocated on disk at m_pa. */
 #define EROFS_MAP_MAPPED 0x0001
 /* Located in metadata. */
-#define EROFS_MAP_META	   0x0002
-#define EROFS_MAP_FRAGMENT 0x0010
+#define EROFS_MAP_META		 0x0002
+#define EROFS_MAP_PARTIAL_MAPPED 0x0004
+#define EROFS_MAP_PARTIAL_REF	 0x0008
+#define EROFS_MAP_FRAGMENT	 0x0010
 
 enum {
 	Z_EROFS_COMPRESSION_SHIFTED = Z_EROFS_COMPRESSION_MAX,
