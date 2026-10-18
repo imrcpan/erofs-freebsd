@@ -797,3 +797,126 @@ z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
 	z_erofs_decode_taskqueue_release(sbi);
 	return (error);
 }
+
+static int
+z_erofs_do_read(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t loff, size_t len, char *out)
+{
+	struct erofs_map_blocks map;
+	void *decoded, *fragment;
+	erofs_off_t mapoff;
+	size_t decoded_len, done, want;
+	bool cache_eligible, partial;
+	enum z_erofs_cache_lookup cache_lookup;
+	int error;
+
+	done = 0;
+	while (done < len) {
+		map = (struct erofs_map_blocks) { .m_la = loff + done };
+		error = erofs_map_blocks(sbi, vi, &map);
+		if (error != 0)
+			return (error);
+		if (map.m_llen == 0 || map.m_la > loff + done ||
+		    loff + done - map.m_la >= map.m_llen)
+			return (EINTEGRITY);
+		mapoff = loff + done - map.m_la;
+		want = MIN((size_t)(map.m_llen - mapoff), len - done);
+
+		if ((map.m_flags & EROFS_MAP_FRAGMENT) != 0) {
+			if (sbi->packed_inode == NULL ||
+			    sbi->packed_inode->nid == vi->nid ||
+			    vi->z_fragmentoff > UINT64_MAX - mapoff)
+				return (EINTEGRITY);
+			error = erofs_read_data(sbi, sbi->packed_inode,
+			    vi->z_fragmentoff + mapoff, want, &fragment);
+			if (error != 0)
+				return (error);
+			memcpy(out + done, fragment, want);
+			erofs_brelse(fragment);
+		} else if ((map.m_flags & EROFS_MAP_MAPPED) == 0) {
+			bzero(out + done, want);
+		} else {
+			z_erofs_decode_length(&map, mapoff, want, &decoded_len,
+			    &partial);
+			cache_eligible = !partial &&
+			    z_erofs_extent_cache_eligible(sbi, vi, &map,
+				decoded_len);
+			cache_lookup = Z_EROFS_CACHE_BYPASS;
+			if (cache_eligible) {
+				cache_lookup = z_erofs_extent_cache_claim(sbi,
+				    vi, &map, decoded_len, mapoff, want,
+				    out + done, &error);
+				if (cache_lookup == Z_EROFS_CACHE_HIT) {
+					done += want;
+					continue;
+				}
+				if (cache_lookup == Z_EROFS_CACHE_ERROR)
+					return (error);
+			} else
+				z_erofs_extent_cache_record_bypass(sbi, &map);
+			error = z_erofs_decode_extent_dispatch(sbi, vi, &map,
+			    decoded_len, partial, &decoded);
+			if (error != 0) {
+				if (cache_lookup == Z_EROFS_CACHE_OWNER)
+					z_erofs_extent_cache_complete(sbi, vi,
+					    &map, decoded_len, NULL, error);
+				return (error);
+			}
+			memcpy(out + done, (char *)decoded + (size_t)mapoff,
+			    want);
+			if (cache_lookup == Z_EROFS_CACHE_OWNER)
+				z_erofs_extent_cache_complete(sbi, vi, &map,
+				    decoded_len, decoded, 0);
+			else
+				free(decoded, M_EROFS);
+		}
+		done += want;
+	}
+	return (0);
+}
+
+int
+z_erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t loff, size_t len, void **bufp)
+{
+	char *out;
+	int error;
+
+	/* erofs_read_data_impl() has checked the arguments and the range. */
+	KASSERT(len != 0 && loff <= vi->size && len <= vi->size - loff,
+	    ("erofs: bad compressed read"));
+	*bufp = NULL;
+	out = malloc(len, M_EROFS, M_WAITOK);
+	error = z_erofs_do_read(sbi, vi, loff, len, out);
+	if (error != 0) {
+		free(out, M_EROFS);
+		return (error);
+	}
+	*bufp = out;
+	return (0);
+}
+
+int
+z_erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct uio *uio)
+{
+	char *buf;
+	size_t want;
+	int error;
+
+	/* erofs_read_uio() has rejected a negative offset. */
+	while (uio->uio_resid > 0 && (uint64_t)uio->uio_offset < vi->size) {
+		want = MIN((size_t)uio->uio_resid,
+		    (size_t)MIN((uint64_t)MAXPHYS,
+			vi->size - (uint64_t)uio->uio_offset));
+		buf = malloc(want, M_EROFS, M_WAITOK);
+		error = z_erofs_do_read(sbi, vi, (uint64_t)uio->uio_offset,
+		    want, buf);
+		if (error == 0)
+			error = uiomove(buf, want, uio);
+		free(buf, M_EROFS);
+		if (error != 0)
+			return (error);
+	}
+	return (0);
+}
