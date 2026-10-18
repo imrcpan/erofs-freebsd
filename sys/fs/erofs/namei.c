@@ -13,6 +13,7 @@
 #include <sys/vnode.h>
 
 #include <fs/erofs/trace.h>
+#include <fs/erofs/xattr.h>
 
 struct erofs_qstr {
 	const unsigned char *name;

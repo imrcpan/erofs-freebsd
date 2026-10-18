@@ -15,6 +15,7 @@
 #include <sys/vnode.h>
 
 #include <fs/erofs/trace.h>
+#include <fs/erofs/xattr.h>
 
 static uint64_t
 erofs_addrmask(const struct erofs_sb_info *sbi)

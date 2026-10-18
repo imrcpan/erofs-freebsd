@@ -34,6 +34,7 @@
 
 #include <fs/erofs/internal.h>
 #include <fs/erofs/trace.h>
+#include <fs/erofs/xattr.h>
 #include <geom/geom.h>
 #include <geom/geom_vfs.h>
 
