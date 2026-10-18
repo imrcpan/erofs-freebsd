@@ -153,12 +153,19 @@ _Static_assert(PAGE_SHIFT <= 16, "EROFS block sizes are at most 64 KiB");
 
 struct erofs_sb_info_opts {
 	unsigned int mount_opt;
+	uint8_t cache_strategy;
 };
 
 enum erofs_sync_decompress {
 	EROFS_SYNC_DECOMPRESS_AUTO,
 	EROFS_SYNC_DECOMPRESS_FORCE_ON,
 	EROFS_SYNC_DECOMPRESS_FORCE_OFF,
+};
+
+enum erofs_zip_cache_strategy {
+	EROFS_ZIP_CACHE_DISABLED,
+	EROFS_ZIP_CACHE_READAHEAD,
+	EROFS_ZIP_CACHE_READAROUND,
 };
 
 struct erofs_device_handle;
@@ -231,6 +238,17 @@ struct erofs_zextent_cache_metrics {
 	size_t resident_bytes;
 };
 
+struct erofs_cache_stats {
+	uint64_t hits;
+	uint64_t misses;
+	uint64_t bypasses;
+	uint64_t evictions;
+	uint64_t reclaims;
+	uint64_t waiter_merges;
+	uint64_t entries;
+	uint64_t bytes;
+};
+
 struct erofs_zextent_cache_entry {
 	struct erofs_zextent_key key;
 	void *data;
@@ -247,6 +265,7 @@ struct erofs_zextent_cache {
 	struct erofs_zextent_cache_entry entries[EROFS_ZCACHE_MAX_ENTRIES];
 	size_t charged_bytes;
 	size_t budget_bytes;
+	uint64_t minimum_decode_work;
 	struct erofs_zextent_cache_metrics metrics[Z_EROFS_COMPRESSION_MAX];
 	uint64_t lru_clock;
 	unsigned int entry_count;
@@ -312,6 +331,7 @@ struct erofs_sb_info {
 	uint32_t meta_blkaddr;
 	erofs_nid_t packed_nid;
 	struct erofs_inode *metabox_en;
+	struct erofs_inode *packed_inode;
 	erofs_blk_t blocks;
 	erofs_nid_t root_nid;
 	int64_t epoch;
@@ -519,6 +539,11 @@ int erofs_lookup(struct vop_cachedlookup_args *ap);
 int z_erofs_fill_inode(struct erofs_sb_info *sbi, struct erofs_inode *vi);
 int z_erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct erofs_map_blocks *map);
+void z_erofs_extent_cache_init(struct erofs_sb_info *sbi);
+void z_erofs_extent_cache_fini(struct erofs_sb_info *sbi);
+int z_erofs_extent_cache_drop(struct erofs_sb_info *sbi);
+void z_erofs_extent_cache_stats(struct erofs_sb_info *sbi,
+    struct erofs_cache_stats *stats);
 void z_erofs_stream_pool_init(struct erofs_sb_info *sbi);
 void z_erofs_stream_pool_fini(struct erofs_sb_info *sbi);
 int z_erofs_stream_ctx_get(struct erofs_sb_info *sbi, uint8_t algorithm,

@@ -453,6 +453,199 @@ z_erofs_decode_taskqueue_release(struct erofs_sb_info *sbi)
 	mtx_unlock(&sbi->z_extent_cache_lock);
 }
 
+void
+z_erofs_extent_cache_init(struct erofs_sb_info *sbi)
+{
+	bzero(&sbi->z_extent_cache, sizeof(sbi->z_extent_cache));
+	sbi->z_extent_cache.budget_bytes = MIN(z_erofs_cache_mount_budget,
+	    EROFS_ZCACHE_MOUNT_HARD_BUDGET);
+	sbi->z_extent_cache.minimum_decode_work =
+	    z_erofs_cache_minimum_decode_work;
+	mtx_init(&sbi->z_extent_cache_lock, "erofs zextent", NULL, MTX_DEF);
+	cv_init(&sbi->decompress_taskqueue_cv, "erofs decode tq");
+	for (unsigned int i = 0; i < nitems(sbi->z_extent_cache.entries); ++i)
+		cv_init(&sbi->z_extent_cache.entries[i].cv, "erofs zextent");
+	z_erofs_decode_taskqueue_init(sbi);
+	sbi->z_extent_cache_initialized = true;
+	mtx_lock(&z_erofs_cache_list_lock);
+	LIST_INSERT_HEAD(&z_erofs_cache_mounts, sbi, z_extent_cache_link);
+	mtx_unlock(&z_erofs_cache_list_lock);
+}
+
+void
+z_erofs_extent_cache_fini(struct erofs_sb_info *sbi)
+{
+	struct erofs_zextent_cache *cache;
+	struct taskqueue *taskqueue;
+	void *data[EROFS_ZCACHE_MAX_ENTRIES];
+	unsigned int count, i;
+
+	if (!sbi->z_extent_cache_initialized)
+		return;
+	cache = &sbi->z_extent_cache;
+	mtx_lock(&z_erofs_cache_list_lock);
+	LIST_REMOVE(sbi, z_extent_cache_link);
+	mtx_unlock(&z_erofs_cache_list_lock);
+	mtx_lock(&sbi->z_extent_cache_lock);
+	cache->closing = true;
+	sbi->z_extent_cache_initialized = false;
+	for (;;) {
+		bool busy = false;
+		unsigned int wait_index = 0;
+		for (i = 0; i < nitems(cache->entries); ++i)
+			if (cache->entries[i].state == EROFS_ZCACHE_INFLIGHT ||
+			    cache->entries[i].waiters != 0) {
+				busy = true;
+				wait_index = i;
+				break;
+			}
+		if (!busy)
+			break;
+		cv_wait(&cache->entries[wait_index].cv,
+		    &sbi->z_extent_cache_lock);
+	}
+	/*
+	 * Workers read &sbi->decompress_taskqueue when they first run, possibly
+	 * after this point, so it is cleared only after taskqueue_free().
+	 */
+	taskqueue = sbi->decompress_taskqueue;
+	sbi->decompress_worker_count = 0;
+	sbi->decompress_worker_cpu_bound = false;
+	while (sbi->decompress_taskqueue_users != 0)
+		cv_wait(&sbi->decompress_taskqueue_cv,
+		    &sbi->z_extent_cache_lock);
+	mtx_unlock(&sbi->z_extent_cache_lock);
+	if (taskqueue != NULL) {
+		taskqueue_drain_all(taskqueue);
+		taskqueue_free(taskqueue);
+	}
+	mtx_lock(&sbi->z_extent_cache_lock);
+	sbi->decompress_taskqueue = NULL;
+	count = 0;
+	for (i = 0; i < nitems(cache->entries); ++i) {
+		if (cache->entries[i].state == EROFS_ZCACHE_READY)
+			data[count++] = z_erofs_extent_cache_drop_entry_locked(
+			    sbi, cache, &cache->entries[i], false, false);
+		else if (cache->entries[i].active)
+			z_erofs_extent_cache_reset_locked(cache,
+			    &cache->entries[i]);
+	}
+	mtx_unlock(&sbi->z_extent_cache_lock);
+	while (count != 0)
+		free(data[--count], M_EROFS);
+	for (i = 0; i < nitems(cache->entries); ++i)
+		cv_destroy(&cache->entries[i].cv);
+	cv_destroy(&sbi->decompress_taskqueue_cv);
+	mtx_destroy(&sbi->z_extent_cache_lock);
+}
+
+int
+z_erofs_extent_cache_drop(struct erofs_sb_info *sbi)
+{
+	struct erofs_zextent_cache *cache;
+	void *data[EROFS_ZCACHE_MAX_ENTRIES];
+	unsigned int count, i;
+
+	if (!sbi->z_extent_cache_initialized)
+		return (ENXIO);
+	cache = &sbi->z_extent_cache;
+	mtx_lock(&sbi->z_extent_cache_lock);
+	if (cache->closing) {
+		mtx_unlock(&sbi->z_extent_cache_lock);
+		return (ENXIO);
+	}
+	for (;;) {
+		bool busy = false;
+		unsigned int wait_index = 0;
+		for (i = 0; i < nitems(cache->entries); ++i)
+			if (cache->entries[i].state == EROFS_ZCACHE_INFLIGHT ||
+			    cache->entries[i].waiters != 0) {
+				busy = true;
+				wait_index = i;
+				break;
+			}
+		if (!busy)
+			break;
+		cv_wait(&cache->entries[wait_index].cv,
+		    &sbi->z_extent_cache_lock);
+	}
+	count = 0;
+	for (i = 0; i < nitems(cache->entries); ++i) {
+		if (cache->entries[i].state == EROFS_ZCACHE_READY)
+			data[count++] = z_erofs_extent_cache_drop_entry_locked(
+			    sbi, cache, &cache->entries[i], true, false);
+		else if (cache->entries[i].active)
+			z_erofs_extent_cache_reset_locked(cache,
+			    &cache->entries[i]);
+	}
+	mtx_unlock(&sbi->z_extent_cache_lock);
+	while (count != 0)
+		free(data[--count], M_EROFS);
+	return (0);
+}
+
+void
+z_erofs_extent_cache_stats(struct erofs_sb_info *sbi,
+    struct erofs_cache_stats *stats)
+{
+	struct erofs_zextent_cache *cache;
+	unsigned int algorithm;
+
+	bzero(stats, sizeof(*stats));
+	if (!sbi->z_extent_cache_initialized)
+		return;
+	cache = &sbi->z_extent_cache;
+	mtx_lock(&sbi->z_extent_cache_lock);
+	for (algorithm = 0; algorithm < Z_EROFS_COMPRESSION_MAX; ++algorithm) {
+		stats->hits += cache->metrics[algorithm].hits;
+		stats->misses += cache->metrics[algorithm].misses;
+		stats->bypasses += cache->metrics[algorithm].bypasses;
+		stats->evictions += cache->metrics[algorithm].evictions;
+		stats->reclaims += cache->metrics[algorithm].reclaims;
+		stats->waiter_merges += cache->metrics[algorithm].waiter_merges;
+		stats->bytes += cache->metrics[algorithm].resident_bytes;
+	}
+	stats->entries = cache->entry_count;
+	mtx_unlock(&sbi->z_extent_cache_lock);
+}
+
+static bool
+z_erofs_extent_cache_eligible(const struct erofs_sb_info *sbi,
+    const struct erofs_inode *vi, const struct erofs_map_blocks *map,
+    size_t len)
+{
+	const struct erofs_zextent_cache *cache;
+	uint64_t decode_work;
+
+	cache = &sbi->z_extent_cache;
+	decode_work = map->m_plen + len; /* at most 1 MiB + 12 MiB */
+	return (z_erofs_cache_enabled != 0 &&
+	    sbi->opt.cache_strategy != EROFS_ZIP_CACHE_DISABLED &&
+	    len <= MAXPHYS && len <= cache->budget_bytes &&
+	    decode_work >= cache->minimum_decode_work &&
+	    (map->m_flags &
+		(EROFS_MAP_META | EROFS_MAP_PARTIAL_MAPPED |
+		    EROFS_MAP_PARTIAL_REF | EROFS_MAP_FRAGMENT)) == 0 &&
+	    map->m_algorithmformat < Z_EROFS_COMPRESSION_MAX &&
+	    sbi->z_extent_cache_initialized && vi != sbi->packed_inode &&
+	    vi != sbi->metabox_en);
+}
+
+static void
+z_erofs_extent_cache_record_bypass(struct erofs_sb_info *sbi,
+    const struct erofs_map_blocks *map)
+{
+	struct erofs_zextent_cache *cache;
+
+	if (!sbi->z_extent_cache_initialized ||
+	    map->m_algorithmformat >= Z_EROFS_COMPRESSION_MAX)
+		return;
+	cache = &sbi->z_extent_cache;
+	mtx_lock(&sbi->z_extent_cache_lock);
+	++cache->metrics[map->m_algorithmformat].bypasses;
+	mtx_unlock(&sbi->z_extent_cache_lock);
+}
+
 static void
 z_erofs_decode_length(const struct erofs_map_blocks *map, erofs_off_t mapoff,
     size_t want, size_t *decoded_len, bool *partial)
