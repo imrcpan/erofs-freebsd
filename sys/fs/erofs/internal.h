@@ -242,6 +242,7 @@ struct erofs_sb_info {
 	uint32_t sb_size;
 	uint8_t blkszbits;
 	uint32_t meta_blkaddr;
+	erofs_nid_t packed_nid;
 	struct erofs_inode *metabox_en;
 	erofs_blk_t blocks;
 	erofs_nid_t root_nid;
@@ -279,6 +280,10 @@ struct erofs_sb_info {
 
 EROFS_FEATURE_FUNCS(lz4_0padding, incompat, INCOMPAT_LZ4_0PADDING)
 EROFS_FEATURE_FUNCS(compr_cfgs, incompat, INCOMPAT_COMPR_CFGS)
+EROFS_FEATURE_FUNCS(big_pcluster, incompat, INCOMPAT_BIG_PCLUSTER)
+EROFS_FEATURE_FUNCS(chunked_file, incompat, INCOMPAT_CHUNKED_FILE)
+EROFS_FEATURE_FUNCS(fragments, incompat, INCOMPAT_FRAGMENTS)
+EROFS_FEATURE_FUNCS(dedupe, incompat, INCOMPAT_DEDUPE)
 EROFS_FEATURE_FUNCS(48bit, incompat, INCOMPAT_48BIT)
 EROFS_FEATURE_FUNCS(metabox, incompat, INCOMPAT_METABOX)
 
@@ -311,6 +316,7 @@ struct erofs_inode {
 	erofs_off_t z_fragmentoff;
 	uint64_t z_tailextent_headlcn;
 	uint64_t z_extents;
+	bool z_initialized;
 	/* Chunk-based fields */
 	uint16_t chunkformat;
 	uint8_t chunkbits;

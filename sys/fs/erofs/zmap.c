@@ -720,3 +720,125 @@ z_erofs_map_blocks_ext(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 	map->m_llen = lend - map->m_la;
 	return (0);
 }
+
+int
+z_erofs_fill_inode(struct erofs_sb_info *sbi, struct erofs_inode *vi)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	struct z_erofs_map_header *h;
+	struct erofs_map_blocks map;
+	uint64_t cluster_size, raw;
+	erofs_off_t pos;
+	unsigned int recsz;
+	int err;
+
+	if (vi->z_initialized)
+		return (0);
+	pos = z_erofs_header_pos(vi);
+	err = erofs_read_metadata_range(sbi, vi->nid, pos, sizeof(*h), &buf);
+	if (err != 0)
+		return (err);
+	h = buf.data;
+	if ((h->h_clusterbits & (1U << Z_EROFS_FRAGMENT_INODE_BIT)) != 0) {
+		if (!erofs_sb_has_fragments(sbi) || sbi->packed_nid == 0) {
+			erofs_put_metabuf(&buf);
+			return (erofs_corrupt(sbi, vi->nid,
+			    "fragment inode, but the image has no packed "
+			    "inode"));
+		}
+		raw = le64dec(h);
+		vi->z_advise = Z_EROFS_ADVISE_FRAGMENT_PCLUSTER;
+		vi->z_fragmentoff = raw ^ (1ULL << 63);
+		vi->z_tailextent_headlcn = 0;
+		erofs_put_metabuf(&buf);
+		vi->z_initialized = true;
+		return (0);
+	}
+
+	vi->z_advise = le16toh(h->h_advise);
+	vi->z_lclusterbits = sbi->blkszbits + (h->h_clusterbits & 15);
+	/* The lcluster size is used as a 32-bit shift count and size below. */
+	if (vi->z_lclusterbits >= 31) {
+		erofs_put_metabuf(&buf);
+		return (erofs_corrupt(sbi, vi->nid,
+		    "lcluster bits %u are too large", vi->z_lclusterbits));
+	}
+	if (vi->datalayout == EROFS_INODE_COMPRESSED_FULL &&
+	    (vi->z_advise & Z_EROFS_ADVISE_EXTENTS) != 0) {
+		recsz = z_erofs_extent_recsize(vi->z_advise);
+		if (recsz <= offsetof(struct z_erofs_extent, pstart_hi)) {
+			cluster_size = 1ULL << vi->z_lclusterbits;
+			vi->z_extents = roundup2(vi->size, cluster_size) >>
+			    vi->z_lclusterbits;
+		} else {
+			vi->z_extents = le32toh(h->h_extents_lo) |
+			    ((uint64_t)le16toh(h->h_extents_hi) << 32);
+		}
+		erofs_put_metabuf(&buf);
+		if ((vi->z_advise & Z_EROFS_ADVISE_FRAGMENT_PCLUSTER) != 0 &&
+		    (!erofs_sb_has_fragments(sbi) || sbi->packed_nid == 0))
+			return (erofs_corrupt(sbi, vi->nid,
+			    "fragment inode, but the image has no packed "
+			    "inode"));
+		vi->z_initialized = true;
+		return (0);
+	}
+	vi->z_algorithmtype[0] = (uint8_t)(h->h_algorithmtype & 15);
+	vi->z_algorithmtype[1] = (uint8_t)(h->h_algorithmtype >> 4);
+	/*
+	 * Both HEAD formats are on-disk algorithm IDs.  IDs at or above
+	 * Z_EROFS_COMPRESSION_MAX would alias the runtime-only SHIFTED and
+	 * INTERLACED formats, so refuse the inode instead of decoding it as
+	 * uncompressed data.
+	 */
+	if (vi->z_algorithmtype[0] >= Z_EROFS_COMPRESSION_MAX ||
+	    vi->z_algorithmtype[1] >= Z_EROFS_COMPRESSION_MAX) {
+		erofs_put_metabuf(&buf);
+		erofs_err(sbi,
+		    "unsupported compression algorithm %u/%u "
+		    "@ nid %ju",
+		    vi->z_algorithmtype[0], vi->z_algorithmtype[1],
+		    (uintmax_t)vi->nid);
+		return (EOPNOTSUPP);
+	}
+	if ((vi->z_advise & Z_EROFS_ADVISE_FRAGMENT_PCLUSTER) != 0)
+		vi->z_fragmentoff = le32toh(h->h_fragmentoff);
+	else if ((vi->z_advise & Z_EROFS_ADVISE_INLINE_PCLUSTER) != 0)
+		vi->z_idata_size = le16toh(h->h_idata_size);
+	erofs_put_metabuf(&buf);
+
+	/* Same rule as Linux: big pcluster advise needs the feature flag. */
+	if (!erofs_sb_has_big_pcluster(sbi) &&
+	    (vi->z_advise &
+		(Z_EROFS_ADVISE_BIG_PCLUSTER_1 |
+		    Z_EROFS_ADVISE_BIG_PCLUSTER_2)) != 0)
+		return (erofs_corrupt(sbi, vi->nid,
+		    "big pcluster advise %#x, but the image has no big "
+		    "pclusters",
+		    vi->z_advise));
+	/*
+	 * Same rule as Linux: compact indexes set both big-pcluster bits or
+	 * neither.
+	 */
+	if (vi->datalayout == EROFS_INODE_COMPRESSED_COMPACT &&
+	    (((vi->z_advise & Z_EROFS_ADVISE_BIG_PCLUSTER_1) != 0) !=
+		((vi->z_advise & Z_EROFS_ADVISE_BIG_PCLUSTER_2) != 0)))
+		return (erofs_corrupt(sbi, vi->nid,
+		    "compact inode with inconsistent big pcluster advise %#x",
+		    vi->z_advise));
+	if (vi->z_idata_size != 0 ||
+	    (vi->z_advise & Z_EROFS_ADVISE_FRAGMENT_PCLUSTER) != 0) {
+		if ((vi->z_advise & Z_EROFS_ADVISE_FRAGMENT_PCLUSTER) != 0 &&
+		    (!erofs_sb_has_fragments(sbi) || sbi->packed_nid == 0))
+			return (erofs_corrupt(sbi, vi->nid,
+			    "fragment inode, but the image has no packed "
+			    "inode"));
+		bzero(&map, sizeof(map));
+		err = z_erofs_map_blocks_fo(sbi, vi, &map,
+		    EROFS_GET_BLOCKS_FINDTAIL);
+		if (err != 0)
+			return (err);
+	}
+	vi->z_initialized = true;
+	return (0);
+}
