@@ -194,3 +194,124 @@ erofs_read_metadata_range(struct erofs_sb_info *sbi, erofs_nid_t nid,
 	buf->release = erofs_brelse;
 	return (0);
 }
+static int
+erofs_check_device_range(const struct erofs_sb_info *sbi,
+    const struct erofs_device_info *dif, erofs_off_t off, uint64_t len)
+{
+	erofs_off_t end, limit;
+
+	if (dif->blocks > (UINT64_MAX >> sbi->blkszbits) ||
+	    __builtin_add_overflow(off, len, &end))
+		return (EINTEGRITY);
+	limit = dif->blocks << sbi->blkszbits;
+	return (end > limit ? EINTEGRITY : 0);
+}
+
+static void
+erofs_fill_from_devinfo(struct erofs_map_dev *map,
+    struct erofs_device_info *dif, erofs_off_t pa)
+{
+	map->m_dif = dif;
+	map->m_pa = pa;
+}
+
+static int
+erofs_map_dev_locate(struct erofs_sb_info *sbi, struct erofs_map_dev *map)
+{
+	struct erofs_device_info *dif;
+	uint64_t start;
+	unsigned int id;
+	int error;
+
+	erofs_fill_from_devinfo(map, &sbi->dif0, map->m_pa);
+	if (map->m_deviceid != 0) {
+		if (map->m_deviceid > sbi->extra_devices || sbi->devs == NULL)
+			return (ENODEV);
+		dif = &sbi->devs[map->m_deviceid - 1];
+		error = erofs_check_device_range(sbi, dif, map->m_pa,
+		    map->m_plen);
+		if (error != 0)
+			return (error);
+		if (sbi->flatdev) {
+			if (dif->uniaddr > (UINT64_MAX >> sbi->blkszbits))
+				return (EINTEGRITY);
+			start = dif->uniaddr << sbi->blkszbits;
+			if (__builtin_add_overflow(map->m_pa, start,
+				&map->m_pa))
+				return (EINTEGRITY);
+			return (0);
+		}
+		if (!erofs_source_is_open(dif))
+			return (ENODEV);
+		erofs_fill_from_devinfo(map, dif, map->m_pa);
+		return (0);
+	}
+
+	if (sbi->extra_devices == 0)
+		return (0);
+	if (sbi->flatdev) {
+		error = erofs_check_device_range(sbi, &sbi->dif0, map->m_pa,
+		    map->m_plen);
+		if (error == 0)
+			return (0);
+		for (id = 0; id < sbi->extra_devices; ++id) {
+			dif = &sbi->devs[id];
+			if (dif->uniaddr == 0 ||
+			    dif->uniaddr > (UINT64_MAX >> sbi->blkszbits))
+				continue;
+			start = dif->uniaddr << sbi->blkszbits;
+			if (map->m_pa < start)
+				continue;
+			error = erofs_check_device_range(sbi, dif,
+			    map->m_pa - start, map->m_plen);
+			if (error == 0)
+				return (0);
+			if (map->m_pa - start < (dif->blocks << sbi->blkszbits))
+				return (error);
+		}
+		return (EINTEGRITY);
+	}
+	for (id = 0; id < sbi->extra_devices; ++id) {
+		dif = &sbi->devs[id];
+		if (dif->uniaddr == 0)
+			continue;
+		if (dif->uniaddr > (UINT64_MAX >> sbi->blkszbits))
+			return (EINTEGRITY);
+		start = dif->uniaddr << sbi->blkszbits;
+		if (map->m_pa >= start &&
+		    map->m_pa - start < (dif->blocks << sbi->blkszbits)) {
+			error = erofs_check_device_range(sbi, dif,
+			    map->m_pa - start, map->m_plen);
+			if (error != 0)
+				return (error);
+			if (!erofs_source_is_open(dif))
+				return (ENODEV);
+			erofs_fill_from_devinfo(map, dif, map->m_pa - start);
+			break;
+		}
+	}
+	return (0);
+}
+
+/*
+ * Resolve a physical range to a device.  The lookup tries several devices
+ * and treats a miss on one as normal, so the corruption is reported here,
+ * once, when no device is able to serve the range.
+ */
+static int
+erofs_map_dev(struct erofs_sb_info *sbi, struct erofs_map_dev *map)
+{
+	uint64_t pa, plen;
+	unsigned int deviceid;
+	int error;
+
+	pa = map->m_pa;
+	plen = map->m_plen;
+	deviceid = map->m_deviceid;
+	error = erofs_map_dev_locate(sbi, map);
+	if (error == EINTEGRITY)
+		return (erofs_corrupt(sbi, EROFS_NID_NONE,
+		    "range %ju+%ju of device %u is not backed by any device",
+		    (uintmax_t)pa, (uintmax_t)plen, deviceid));
+	return (error);
+}

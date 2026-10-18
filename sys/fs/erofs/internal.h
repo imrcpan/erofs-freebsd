@@ -173,6 +173,7 @@ struct erofs_device_info {
 	uint64_t fsoff;
 
 	erofs_blk_t blocks;
+	erofs_blk_t uniaddr;
 };
 
 static inline bool
@@ -206,6 +207,11 @@ struct erofs_sb_info {
 	uint32_t feature_incompat;
 
 	struct erofs_sb_info_opts opt;
+
+	/* Device table */
+	uint16_t extra_devices;
+	bool flatdev;
+	struct erofs_device_info *devs;
 };
 
 #define EROFS_FEATURE_FUNCS(name, compat, feature)                           \
@@ -261,6 +267,14 @@ erofs_nid_in_metabox(erofs_nid_t nid)
 {
 	return ((nid & BIT_ULL(EROFS_DIRENT_NID_METABOX_BIT)) != 0);
 }
+
+struct erofs_map_dev {
+	struct erofs_device_info *m_dif;
+
+	erofs_off_t m_pa;
+	unsigned int m_deviceid;
+	uint64_t m_plen;
+};
 
 struct erofs_buf {
 	void *data;
