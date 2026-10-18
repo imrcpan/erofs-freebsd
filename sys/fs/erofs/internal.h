@@ -454,6 +454,9 @@ int z_erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 int z_erofs_decompress(struct erofs_sb_info *sbi,
     const struct erofs_map_blocks *map, const void *src, size_t srclen,
     void *dst, size_t dstlen, bool partial);
+int z_erofs_decode_extent(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct erofs_map_blocks *map, size_t decoded_len, bool partial,
+    void **bufp);
 
 /* Compression configuration. */
 int z_erofs_parse_cfgs(struct erofs_sb_info *sbi,
