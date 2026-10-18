@@ -137,3 +137,109 @@ erofs_xattr_filter_name(int attrnamespace, const char *name, size_t name_len,
 	}
 	return (false);
 }
+
+static int
+erofs_xattr_read_backing(struct erofs_sb_info *sbi,
+    struct erofs_inode *backing_en, erofs_off_t off, size_t len,
+    struct erofs_buf *buf)
+{
+	void *data;
+	int error;
+
+	/* Both reads check the range (and report it) themselves. */
+	if (backing_en != NULL)
+		error = erofs_read_data(sbi, backing_en, off, len, &data);
+	else
+		error = erofs_bread(sbi, off, len, &data);
+	if (error != 0)
+		return (error);
+	buf->data = data;
+	buf->release = erofs_brelse;
+	return (0);
+}
+
+/*
+ * Read one prefix table metadata record.
+ *
+ * When backing_en == NULL the record is in the physical metadata area;
+ * otherwise it lives in the selected metadata carrier's logical data stream.
+ */
+static int
+erofs_xattr_read_metadata(struct erofs_sb_info *sbi,
+    struct erofs_inode *backing_en, erofs_off_t *offp, struct erofs_buf *buf,
+    size_t *lenp)
+{
+	struct erofs_buf hdrbuf = EROFS_BUF_INITIALIZER;
+	uint16_t raw_len;
+	erofs_off_t off;
+	size_t len;
+	int error;
+
+	/* The offset is below 2^35: 255 records of at most 64 KiB each. */
+	off = roundup2(*offp, sizeof(struct erofs_xattr_entry));
+	error = erofs_xattr_read_backing(sbi, backing_en, off, sizeof(raw_len),
+	    &hdrbuf);
+	if (error != 0)
+		return (error);
+	raw_len = le16dec(hdrbuf.data);
+	erofs_put_metabuf(&hdrbuf);
+	len = (raw_len == 0) ? (size_t)UINT16_MAX + 1 : raw_len;
+	if (len < sizeof(struct erofs_xattr_long_prefix) ||
+	    len > EROFS_NAME_LEN + sizeof(struct erofs_xattr_long_prefix))
+		return (erofs_corrupt(sbi, EROFS_NID_NONE,
+		    "xattr prefix record of %zu bytes at %ju has an invalid "
+		    "size",
+		    len, (uintmax_t)off));
+	error = erofs_xattr_read_backing(sbi, backing_en, off + sizeof(raw_len),
+	    len, buf);
+	if (error != 0)
+		return (error);
+	*offp = off + sizeof(raw_len) + len;
+	*lenp = len;
+	return (0);
+}
+
+static int
+erofs_xattr_load_body_uncached(struct erofs_sb_info *sbi,
+    struct erofs_inode *vi, struct erofs_buf *bodybuf,
+    struct erofs_xattr_ibody_header **ihp, size_t *header_sizep)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	struct erofs_xattr_ibody_header *ih;
+	char *body;
+	uint64_t body_off;
+	size_t header_size;
+	int error;
+
+	if (vi->xattr_isize < sizeof(*ih))
+		return (erofs_corrupt(sbi, vi->nid,
+		    "xattr area of %zu bytes is smaller than its header",
+		    (size_t)vi->xattr_isize));
+	body_off = vi->inode_off + vi->inode_isize;
+	error = erofs_xattr_read_backing(sbi,
+	    erofs_nid_in_metabox(vi->nid) ? sbi->metabox_en : NULL, body_off,
+	    vi->xattr_isize, &buf);
+	if (error != 0)
+		return (error);
+	body = buf.data;
+	ih = (struct erofs_xattr_ibody_header *)body;
+	if (vi->xattr_isize == sizeof(*ih)) {
+		error = EOPNOTSUPP;
+		goto fail;
+	}
+	header_size = sizeof(*ih) + sizeof(uint32_t) * ih->h_shared_count;
+	if (header_size > vi->xattr_isize) {
+		error = erofs_corrupt(sbi, vi->nid,
+		    "%u shared xattr ids do not fit the xattr area of %zu "
+		    "bytes",
+		    ih->h_shared_count, (size_t)vi->xattr_isize);
+		goto fail;
+	}
+	*bodybuf = buf;
+	*ihp = ih;
+	*header_sizep = header_size;
+	return (0);
+fail:
+	erofs_put_metabuf(&buf);
+	return (error);
+}
