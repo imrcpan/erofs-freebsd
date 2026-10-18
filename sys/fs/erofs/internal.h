@@ -414,6 +414,8 @@ int erofs_lookup(struct vop_cachedlookup_args *ap);
 int z_erofs_fill_inode(struct erofs_sb_info *sbi, struct erofs_inode *vi);
 int z_erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct erofs_map_blocks *map);
+void z_erofs_stream_pool_init(struct erofs_sb_info *sbi);
+void z_erofs_stream_pool_fini(struct erofs_sb_info *sbi);
 int z_erofs_stream_ctx_get(struct erofs_sb_info *sbi, uint8_t algorithm,
     size_t context_size, erofs_stream_ctx_init_t *init,
     erofs_stream_ctx_fini_t *fini, struct erofs_stream_ctx **ctxp);

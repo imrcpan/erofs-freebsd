@@ -46,6 +46,7 @@ static unsigned int erofs_stream_global_waiters;
 static LIST_HEAD(, erofs_sb_info) erofs_stream_mounts = LIST_HEAD_INITIALIZER(
     erofs_stream_mounts);
 static uma_zone_t erofs_stream_zone;
+static eventhandler_tag erofs_stream_lowmem_tag;
 static size_t erofs_stream_global_resident;
 static unsigned int erofs_stream_global_contexts;
 static unsigned int
@@ -516,3 +517,141 @@ z_erofs_stream_ctx_put(struct erofs_stream_ctx *ctx, bool reusable)
 	mtx_unlock(&erofs_stream_lock);
 	erofs_stream_ctx_destroy(ctx);
 }
+
+static bool
+erofs_stream_pool_empty_locked(const struct erofs_stream_pool *pool)
+{
+	unsigned int algorithm;
+
+	mtx_assert(&erofs_stream_lock, MA_OWNED);
+	for (algorithm = 0; algorithm < Z_EROFS_COMPRESSION_MAX; ++algorithm) {
+		if (pool->codec[algorithm].contexts != 0)
+			return (false);
+	}
+	return (true);
+}
+
+void
+z_erofs_stream_pool_init(struct erofs_sb_info *sbi)
+{
+	unsigned int algorithm;
+
+	bzero(&sbi->stream_pool, sizeof(sbi->stream_pool));
+	for (algorithm = 0; algorithm < Z_EROFS_COMPRESSION_MAX; ++algorithm)
+		STAILQ_INIT(&sbi->stream_pool.codec[algorithm].idle);
+	cv_init(&sbi->stream_pool.cv, "erofs stream drain");
+	mtx_lock(&erofs_stream_lock);
+	sbi->stream_pool_initialized = true;
+	LIST_INSERT_HEAD(&erofs_stream_mounts, sbi, stream_pool_link);
+	mtx_unlock(&erofs_stream_lock);
+}
+
+void
+z_erofs_stream_pool_fini(struct erofs_sb_info *sbi)
+{
+	struct erofs_stream_ctx *ctx;
+
+	if (!sbi->stream_pool_initialized)
+		return;
+	mtx_lock(&erofs_stream_lock);
+	sbi->stream_pool.closing = true;
+	erofs_stream_wake_locked(sbi);
+	for (;;) {
+		ctx = erofs_stream_take_idle_locked(sbi);
+		if (ctx == NULL)
+			break;
+		mtx_unlock(&erofs_stream_lock);
+		erofs_stream_ctx_destroy(ctx);
+		mtx_lock(&erofs_stream_lock);
+	}
+	while (!erofs_stream_pool_empty_locked(&sbi->stream_pool) ||
+	    sbi->stream_pool.waiters != 0)
+		cv_wait(&sbi->stream_pool.cv, &erofs_stream_lock);
+	KASSERT(sbi->stream_pool.resident_bytes == 0,
+	    ("erofs stream mount bytes remain at unmount"));
+	LIST_REMOVE(sbi, stream_pool_link);
+	sbi->stream_pool_initialized = false;
+	mtx_unlock(&erofs_stream_lock);
+	cv_destroy(&sbi->stream_pool.cv);
+}
+
+static void
+erofs_stream_pool_lowmem(void *arg __unused, int howto __unused)
+{
+	struct erofs_stream_ctx *ctx;
+	struct erofs_sb_info *sbi;
+
+	for (;;) {
+		ctx = NULL;
+		mtx_lock(&erofs_stream_lock);
+		LIST_FOREACH(sbi, &erofs_stream_mounts, stream_pool_link) {
+			ctx = erofs_stream_take_idle_locked(sbi);
+			if (ctx != NULL) {
+				++erofs_stream_reclaims;
+				break;
+			}
+		}
+		mtx_unlock(&erofs_stream_lock);
+		if (ctx == NULL)
+			break;
+		erofs_stream_ctx_destroy(ctx);
+	}
+}
+
+static void
+erofs_stream_pool_global_init(void *arg __unused)
+{
+	erofs_stream_mount_budget = MIN(erofs_stream_mount_budget,
+	    EROFS_STREAM_MOUNT_HARD_BUDGET);
+	erofs_stream_global_budget = MIN(erofs_stream_global_budget,
+	    EROFS_STREAM_GLOBAL_HARD_BUDGET);
+	erofs_stream_mount_contexts = MAX(0,
+	    MIN(erofs_stream_mount_contexts,
+		(int)EROFS_STREAM_MOUNT_HARD_CONTEXTS));
+	erofs_stream_global_contexts_limit = MAX(0,
+	    MIN(erofs_stream_global_contexts_limit,
+		(int)EROFS_STREAM_GLOBAL_HARD_CONTEXTS));
+	erofs_stream_mount_cached = MAX(0,
+	    MIN(erofs_stream_mount_cached,
+		(int)EROFS_STREAM_MOUNT_CACHED_PER_CODEC));
+	erofs_stream_global_cached = MAX(0,
+	    MIN(erofs_stream_global_cached,
+		(int)EROFS_STREAM_GLOBAL_CACHED_PER_CODEC));
+	cv_init(&erofs_stream_global_cv, "erofs stream wait");
+	/*
+	 * The context count is bounded by erofs_stream_global_contexts_limit;
+	 * a UMA item limit would only add a second, unrelated place to sleep.
+	 */
+	erofs_stream_zone = uma_zcreate("erofs stream ctx",
+	    EROFS_STREAM_CTX_WRAPPER_SIZE, NULL, NULL, NULL, NULL,
+	    UMA_ALIGN_PTR, 0);
+	KASSERT(erofs_stream_zone != NULL,
+	    ("cannot create erofs stream UMA zone"));
+	uma_zone_set_maxcache(erofs_stream_zone,
+	    EROFS_STREAM_GLOBAL_CACHED_PER_CODEC * 3);
+	erofs_stream_lowmem_tag = EVENTHANDLER_REGISTER(vm_lowmem,
+	    erofs_stream_pool_lowmem, NULL, LOWMEM_PRI_DEFAULT);
+}
+
+static void
+erofs_stream_pool_global_fini(void *arg __unused)
+{
+	if (erofs_stream_lowmem_tag != NULL)
+		EVENTHANDLER_DEREGISTER(vm_lowmem, erofs_stream_lowmem_tag);
+	KASSERT(LIST_EMPTY(&erofs_stream_mounts),
+	    ("erofs stream mounts remain at unload"));
+	KASSERT(erofs_stream_global_contexts == 0 &&
+		erofs_stream_global_waiters == 0 &&
+		erofs_stream_global_resident == 0 &&
+		erofs_stream_borrowed_contexts == 0 &&
+		erofs_stream_idle_contexts == 0 &&
+		erofs_stream_cached_contexts == 0,
+	    ("erofs stream resources remain at unload"));
+	uma_zdestroy(erofs_stream_zone);
+	cv_destroy(&erofs_stream_global_cv);
+}
+
+SYSINIT(erofs_stream_pool_global, SI_SUB_VFS, SI_ORDER_FIRST,
+    erofs_stream_pool_global_init, NULL);
+SYSUNINIT(erofs_stream_pool_global, SI_SUB_VFS, SI_ORDER_FIRST,
+    erofs_stream_pool_global_fini, NULL);
