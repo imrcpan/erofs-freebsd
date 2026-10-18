@@ -16,7 +16,13 @@ struct z_erofs_decompress_req {
 };
 
 struct z_erofs_decompressor {
+	/* Callbacks return zero or a positive FreeBSD errno. */
+	int (*config)(struct erofs_sb_info *, const struct erofs_super_block *,
+	    const void *, size_t);
 	int (*decompress)(const struct z_erofs_decompress_req *);
 };
+
+int z_erofs_lz4_buffer_decompress(const struct z_erofs_decompress_req *rq);
+extern const struct z_erofs_decompressor z_erofs_lz4_decomp;
 
 #endif

@@ -13,6 +13,31 @@
 #include <fs/erofs/compress.h>
 
 static int
+z_erofs_load_lz4_config(struct erofs_sb_info *sbi,
+    const struct erofs_super_block *dsb, const void *data, size_t size)
+{
+	const struct z_erofs_lz4_cfgs *lz4;
+	uint32_t max_pclusterblks;
+	uint16_t distance;
+
+	if (data != NULL) {
+		if (size < sizeof(*lz4))
+			return (EINTEGRITY);
+		lz4 = data;
+		max_pclusterblks = le16toh(lz4->max_pclusterblks);
+		if (max_pclusterblks >
+		    (Z_EROFS_PCLUSTER_MAX_SIZE >> sbi->blkszbits))
+			return (EOPNOTSUPP);
+	} else {
+		distance = le16toh(dsb->u1.lz4_max_distance);
+		if (distance == 0 && !erofs_sb_has_lz4_0padding(sbi))
+			return (0);
+		sbi->available_compr_algs = 1U << Z_EROFS_COMPRESSION_LZ4;
+	}
+	return (0);
+}
+
+static int
 z_erofs_transform_plain(const struct z_erofs_decompress_req *rq)
 {
 	const uint8_t *src;
@@ -49,9 +74,15 @@ static const struct z_erofs_decompressor z_erofs_interlaced_decomp = {
 	.decompress = z_erofs_transform_plain,
 };
 
+const struct z_erofs_decompressor z_erofs_lz4_decomp = {
+	.config = z_erofs_load_lz4_config,
+	.decompress = z_erofs_lz4_buffer_decompress,
+};
+
 static const struct z_erofs_decompressor *const z_erofs_decomp[] = {
 	[Z_EROFS_COMPRESSION_SHIFTED] = &z_erofs_shifted_decomp,
 	[Z_EROFS_COMPRESSION_INTERLACED] = &z_erofs_interlaced_decomp,
+	[Z_EROFS_COMPRESSION_LZ4] = &z_erofs_lz4_decomp,
 };
 
 int

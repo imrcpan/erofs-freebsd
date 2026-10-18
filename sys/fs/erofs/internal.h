@@ -217,6 +217,7 @@ struct erofs_sb_info {
 	uint32_t feature_incompat;
 
 	struct erofs_sb_info_opts opt;
+	uint16_t available_compr_algs;
 
 	/* Device table */
 	uint16_t extra_devices;
