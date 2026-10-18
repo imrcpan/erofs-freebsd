@@ -200,6 +200,13 @@ struct erofs_map_blocks {
 	unsigned int m_flags;
 };
 
+struct erofs_stream_pool {
+	size_t resident_bytes;
+	unsigned int waiters;
+	struct cv cv;
+	bool closing;
+};
+
 struct erofs_sb_info {
 	struct mount *mnt;
 	struct erofs_device_info dif0;
@@ -226,6 +233,8 @@ struct erofs_sb_info {
 	bool flatdev;
 	erofs_blk_t flatdev_blocks;
 	struct erofs_device_info *devs;
+	struct erofs_stream_pool stream_pool;
+	LIST_ENTRY(erofs_sb_info) stream_pool_link;
 };
 
 #define MTOE(mp) ((struct erofs_sb_info *)(mp)->mnt_data)
