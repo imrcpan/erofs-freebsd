@@ -11,4 +11,6 @@
 #endif
 
 #include <fs/erofs/internal.h>
+void erofs_xattr_cache_init(struct erofs_inode *vi);
+void erofs_xattr_cache_fini(struct erofs_sb_info *sbi, struct erofs_inode *vi);
 #endif

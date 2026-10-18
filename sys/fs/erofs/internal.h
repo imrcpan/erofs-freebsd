@@ -286,6 +286,25 @@ struct erofs_decompress_task {
 	bool done;
 };
 
+enum erofs_xattr_cache_state {
+	EROFS_XATTR_CACHE_EMPTY,
+	EROFS_XATTR_CACHE_INFLIGHT,
+	EROFS_XATTR_CACHE_READY,
+	EROFS_XATTR_CACHE_FAILED,
+};
+
+struct erofs_xattr_cache {
+	struct mtx lock;
+	struct cv cv;
+	void *data;
+	size_t charged_bytes;
+	unsigned int waiters;
+	int error;
+	enum erofs_xattr_cache_state state;
+	bool closing;
+	bool initialized;
+};
+
 #define EROFS_STREAM_CTX_WRAPPER_SIZE 256
 
 struct erofs_stream_ctx;
@@ -368,6 +387,7 @@ struct erofs_sb_info {
 	struct erofs_stream_pool stream_pool;
 	LIST_ENTRY(erofs_sb_info) stream_pool_link;
 	bool stream_pool_initialized;
+	volatile u_long xattr_cache_resident;
 };
 
 #define MTOE(mp) ((struct erofs_sb_info *)(mp)->mnt_data)
@@ -422,6 +442,8 @@ struct erofs_inode {
 	/* Chunk-based fields */
 	uint16_t chunkformat;
 	uint8_t chunkbits;
+	/* Fragment fields */
+	struct erofs_xattr_cache xattr_cache;
 };
 
 #define VTOE(vp) ((struct erofs_inode *)(vp)->v_data)

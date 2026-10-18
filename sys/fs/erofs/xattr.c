@@ -21,6 +21,8 @@
 #include <machine/atomic.h>
 
 #include <fs/erofs/xattr.h>
+#define EROFS_XATTR_CACHE_BODY_LIMIT   (64UL * 1024)
+#define EROFS_XATTR_CACHE_MOUNT_BUDGET (1024UL * 1024)
 
 static uint32_t
 erofs_xxh32_rotl(uint32_t value, unsigned int count)
@@ -242,4 +244,80 @@ erofs_xattr_load_body_uncached(struct erofs_sb_info *sbi,
 fail:
 	erofs_put_metabuf(&buf);
 	return (error);
+}
+
+static bool
+erofs_xattr_cache_reserve(struct erofs_sb_info *sbi, size_t size)
+{
+	u_long resident;
+
+	for (;;) {
+		resident = atomic_load_acq_long(&sbi->xattr_cache_resident);
+		if (resident > EROFS_XATTR_CACHE_MOUNT_BUDGET ||
+		    size > EROFS_XATTR_CACHE_MOUNT_BUDGET - resident)
+			return (false);
+		if (atomic_cmpset_acq_long(&sbi->xattr_cache_resident, resident,
+			resident + size))
+			return (true);
+	}
+}
+
+static void
+erofs_xattr_cache_release(struct erofs_sb_info *sbi, size_t size)
+{
+	KASSERT(size <= EROFS_XATTR_CACHE_MOUNT_BUDGET,
+	    ("erofs xattr cache release exceeds mount budget"));
+	atomic_subtract_rel_long(&sbi->xattr_cache_resident, size);
+}
+
+static void *
+erofs_xattr_cache_invalidate_locked(struct erofs_sb_info *sbi,
+    struct erofs_xattr_cache *cache)
+{
+	void *data;
+
+	data = cache->data;
+	if (cache->charged_bytes != 0) {
+		erofs_xattr_cache_release(sbi, cache->charged_bytes);
+		cache->charged_bytes = 0;
+	}
+	cache->data = NULL;
+	cache->error = 0;
+	cache->state = EROFS_XATTR_CACHE_EMPTY;
+	return (data);
+}
+
+void
+erofs_xattr_cache_init(struct erofs_inode *vi)
+{
+	struct erofs_xattr_cache *cache;
+
+	cache = &vi->xattr_cache;
+	bzero(cache, sizeof(*cache));
+	mtx_init(&cache->lock, "erofs xattr", NULL, MTX_DEF);
+	cv_init(&cache->cv, "erofs xattr");
+	cache->state = EROFS_XATTR_CACHE_EMPTY;
+	cache->initialized = true;
+}
+
+void
+erofs_xattr_cache_fini(struct erofs_sb_info *sbi, struct erofs_inode *vi)
+{
+	struct erofs_xattr_cache *cache;
+	void *data;
+
+	cache = &vi->xattr_cache;
+	if (!cache->initialized)
+		return;
+	mtx_lock(&cache->lock);
+	cache->closing = true;
+	while (
+	    cache->state == EROFS_XATTR_CACHE_INFLIGHT || cache->waiters != 0)
+		cv_wait(&cache->cv, &cache->lock);
+	data = erofs_xattr_cache_invalidate_locked(sbi, cache);
+	cache->initialized = false;
+	mtx_unlock(&cache->lock);
+	free(data, M_EROFS);
+	cv_destroy(&cache->cv);
+	mtx_destroy(&cache->lock);
 }
