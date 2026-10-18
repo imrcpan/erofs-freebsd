@@ -194,8 +194,10 @@ struct erofs_sb_info {
 
 	uint32_t block_size;
 	uint8_t blkszbits;
+	uint32_t meta_blkaddr;
 	struct erofs_inode *metabox_en;
 	erofs_blk_t blocks;
+	uint32_t generation_seed;
 	uint32_t feature_compat;
 	uint32_t feature_incompat;
 
@@ -209,11 +211,21 @@ struct erofs_sb_info {
 		return (                                                     \
 		    (sbi->feature_##compat & EROFS_FEATURE_##feature) != 0); \
 	}
+EROFS_FEATURE_FUNCS(48bit, incompat, INCOMPAT_48BIT)
 EROFS_FEATURE_FUNCS(metabox, incompat, INCOMPAT_METABOX)
 
 struct erofs_inode {
 	erofs_nid_t nid;
+	uint64_t size;
+	uint64_t data_blocks;
+	/* Byte offset in the device, or in the metabox for a metabox nid. */
+	erofs_off_t inode_off;
 	__enum_uint8(vtype) vtype;
+	time_t mtime;
+	uint32_t mtime_nsec;
+	uint8_t datalayout;
+	uint8_t inode_isize;
+	uint32_t xattr_isize;
 };
 
 static inline bool
@@ -241,5 +253,8 @@ int erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 /* File-backed source I/O is owned by fileio.c. */
 int erofs_read_file_source(struct erofs_sb_info *sbi,
     struct erofs_device_info *dif, erofs_off_t off, size_t len, void *out);
+
+/* Inode and vnode lifecycle. */
+bool erofs_nid_is_valid(struct erofs_sb_info *sbi, erofs_nid_t nid);
 
 #endif /* _FS_EROFS_INTERNAL_H_ */
