@@ -191,6 +191,14 @@ erofs_source_is_file(const struct erofs_device_info *dif)
 	    erofs_source_is_open(dif) && dif->source_kind == EROFS_SOURCE_FILE);
 }
 
+struct erofs_map_blocks {
+	erofs_off_t m_pa, m_la;
+	uint64_t m_plen, m_llen;
+
+	unsigned short m_deviceid;
+	unsigned int m_flags;
+};
+
 struct erofs_sb_info {
 	struct mount *mnt;
 	struct erofs_device_info dif0;
@@ -210,6 +218,7 @@ struct erofs_sb_info {
 
 	/* Device table */
 	uint16_t extra_devices;
+	uint16_t device_id_mask;
 	bool flatdev;
 	erofs_blk_t flatdev_blocks;
 	struct erofs_device_info *devs;
@@ -269,6 +278,11 @@ erofs_nid_in_metabox(erofs_nid_t nid)
 	return ((nid & BIT_ULL(EROFS_DIRENT_NID_METABOX_BIT)) != 0);
 }
 
+/* Allocated on disk at m_pa. */
+#define EROFS_MAP_MAPPED 0x0001
+/* Located in metadata. */
+#define EROFS_MAP_META 0x0002
+
 struct erofs_map_dev {
 	struct erofs_device_info *m_dif;
 
@@ -294,6 +308,8 @@ void erofs_brelse(void *buf);
 int erofs_read_metadata_range(struct erofs_sb_info *sbi, erofs_nid_t nid,
     erofs_off_t off, size_t len, struct erofs_buf *buf);
 /* Logical mapping and file data. */
+int erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct erofs_map_blocks *map);
 int erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     erofs_off_t loff, size_t len, void **bufp);
 
@@ -308,5 +324,7 @@ int erofs_read_inode(struct erofs_sb_info *sbi, erofs_nid_t nid,
 
 /* Compressed mapping and data. */
 int z_erofs_fill_inode(struct erofs_sb_info *sbi, struct erofs_inode *vi);
+int z_erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct erofs_map_blocks *map);
 
 #endif /* _FS_EROFS_INTERNAL_H_ */

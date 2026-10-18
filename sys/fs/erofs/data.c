@@ -196,6 +196,187 @@ erofs_read_metadata_range(struct erofs_sb_info *sbi, erofs_nid_t nid,
 	buf->release = erofs_brelse;
 	return (0);
 }
+
+static int
+erofs_map_blocks_chunk(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct erofs_map_blocks *map)
+{
+	struct erofs_inode_chunk_index *idx;
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	uint64_t chunk_idx, chunk_size, entry_size;
+	erofs_off_t loff, chunk_start, idx_off, idx_base;
+	uint64_t image_size, addrmask;
+	uint64_t blkaddr;
+	uint16_t raw_device_id;
+	int error;
+
+	loff = map->m_la;
+	chunk_size = 1ULL << vi->chunkbits;
+	chunk_idx = loff >> vi->chunkbits;
+	chunk_start = chunk_idx << vi->chunkbits;
+
+	if ((vi->chunkformat & EROFS_CHUNK_FORMAT_INDEXES) != 0)
+		entry_size = sizeof(struct erofs_inode_chunk_index);
+	else
+		entry_size = EROFS_BLOCK_MAP_ENTRY_SIZE;
+	/*
+	 * inode_off is below 2^63 (the image fits its provider, whose size is
+	 * an off_t; a metabox is at most OFF_MAX), isize is 32 or 64 and
+	 * xattr_isize is below 2^19; chunk_idx is below 2^54 because
+	 * loff < size <= OFF_MAX and a chunk has at least 512 bytes.
+	 */
+	idx_base = roundup2(vi->inode_off + vi->inode_isize + vi->xattr_isize,
+	    entry_size);
+	idx_off = idx_base + chunk_idx * entry_size;
+	if (erofs_nid_in_metabox(vi->nid)) {
+		if (sbi->metabox_en == NULL ||
+		    idx_off > sbi->metabox_en->size ||
+		    entry_size > sbi->metabox_en->size - idx_off)
+			return (erofs_corrupt(sbi, vi->nid,
+			    "chunk %ju: index entry at %ju is beyond the "
+			    "metabox",
+			    (uintmax_t)chunk_idx, (uintmax_t)idx_off));
+	} else {
+		image_size = sbi->blocks << sbi->blkszbits;
+		if (idx_off > image_size || entry_size > image_size - idx_off)
+			return (erofs_corrupt(sbi, vi->nid,
+			    "chunk %ju: index entry at %ju is beyond the image",
+			    (uintmax_t)chunk_idx, (uintmax_t)idx_off));
+	}
+
+	error = erofs_read_metadata_range(sbi, vi->nid, idx_off, entry_size,
+	    &buf);
+	if (error != 0)
+		return (error);
+
+	idx = buf.data;
+	if ((vi->chunkformat & EROFS_CHUNK_FORMAT_INDEXES) != 0) {
+		blkaddr = le32toh(idx->startblk_lo);
+		if ((vi->chunkformat & EROFS_CHUNK_FORMAT_48BIT) != 0)
+			blkaddr |= (uint64_t)le16toh(idx->startblk_hi) << 32;
+		raw_device_id = le16toh(idx->device_id);
+		addrmask = (vi->chunkformat & EROFS_CHUNK_FORMAT_48BIT) != 0 ?
+		    ((1ULL << 48) - 1) :
+		    UINT32_MAX;
+	} else {
+		blkaddr = le32dec(idx);
+		raw_device_id = 0;
+		addrmask = UINT32_MAX;
+	}
+	erofs_put_metabuf(&buf);
+
+	if (!((blkaddr ^ EROFS_NULL_ADDR) & addrmask)) {
+		map->m_la = chunk_start;
+		map->m_pa = 0;
+		map->m_llen = MIN(chunk_size, vi->size - chunk_start);
+		map->m_plen = map->m_llen;
+		return (0);
+	}
+
+	map->m_la = chunk_start;
+	map->m_llen = MIN(chunk_size, vi->size - chunk_start);
+	map->m_plen = map->m_llen;
+	map->m_deviceid = raw_device_id & sbi->device_id_mask;
+	/* blkaddr has at most 48 bits and blkszbits at most 16. */
+	map->m_pa = blkaddr << sbi->blkszbits;
+	map->m_flags |= EROFS_MAP_MAPPED;
+	return (0);
+}
+
+static erofs_off_t
+erofs_inline_tail_start(const struct erofs_sb_info *sbi,
+    const struct erofs_inode *vi)
+{
+	if (vi->size == 0)
+		return (0);
+	return (
+	    roundup2(vi->size, (uint64_t)sbi->block_size) - sbi->block_size);
+}
+
+static int
+erofs_map_blocks_flatmode(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct erofs_map_blocks *map)
+{
+	erofs_off_t loff, tail_start;
+	uint64_t remain, block_rem;
+
+	loff = map->m_la;
+	if (loff >= vi->size)
+		return (0);
+
+	remain = vi->size - loff;
+	switch (vi->datalayout) {
+	case EROFS_INODE_CHUNK_BASED:
+		return (erofs_map_blocks_chunk(sbi, vi, map));
+	case EROFS_INODE_FLAT_PLAIN:
+		map->m_llen = remain;
+		map->m_plen = map->m_llen;
+		if (vi->startblk == EROFS_NULL_ADDR)
+			return (0);
+		if (vi->startblk > (UINT64_MAX >> sbi->blkszbits) ||
+		    __builtin_add_overflow(vi->startblk << sbi->blkszbits, loff,
+			&map->m_pa))
+			return (erofs_corrupt(sbi, vi->nid,
+			    "start block %ju overflows",
+			    (uintmax_t)vi->startblk));
+		map->m_flags |= EROFS_MAP_MAPPED;
+		return (0);
+	case EROFS_INODE_FLAT_INLINE:
+		tail_start = erofs_inline_tail_start(sbi, vi);
+		if (loff < tail_start) {
+			map->m_llen = MIN(remain, tail_start - loff);
+			map->m_plen = map->m_llen;
+			if (vi->startblk == EROFS_NULL_ADDR)
+				return (0);
+			if (vi->startblk > (UINT64_MAX >> sbi->blkszbits) ||
+			    __builtin_add_overflow(vi->startblk
+				    << sbi->blkszbits,
+				loff, &map->m_pa))
+				return (erofs_corrupt(sbi, vi->nid,
+				    "start block %ju overflows",
+				    (uintmax_t)vi->startblk));
+			map->m_flags |= EROFS_MAP_MAPPED;
+			return (0);
+		}
+		block_rem = sbi->block_size -
+		    ((loff - tail_start) & (sbi->block_size - 1));
+		map->m_llen = MIN(remain, block_rem);
+		map->m_plen = map->m_llen;
+		if (__builtin_add_overflow(vi->inode_off, vi->inode_isize,
+			&map->m_pa) ||
+		    __builtin_add_overflow(map->m_pa, vi->xattr_isize,
+			&map->m_pa) ||
+		    __builtin_add_overflow(map->m_pa, loff - tail_start,
+			&map->m_pa))
+			return (erofs_corrupt(sbi, vi->nid,
+			    "inline tail position overflows"));
+		map->m_flags |= EROFS_MAP_MAPPED | EROFS_MAP_META;
+		return (0);
+	case EROFS_INODE_COMPRESSED_FULL:
+	case EROFS_INODE_COMPRESSED_COMPACT:
+		return (EOPNOTSUPP);
+	default:
+		return (EOPNOTSUPP);
+	}
+}
+
+int
+erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct erofs_map_blocks *map)
+{
+	struct erofs_map_blocks next = { .m_la = map->m_la };
+	int err;
+
+	EROFS_TRACE_MAP_BLOCKS_ENTER(vi, map, 0);
+	if (erofs_inode_is_data_compressed(vi->datalayout)) {
+		err = z_erofs_map_blocks(sbi, vi, &next);
+	} else {
+		err = erofs_map_blocks_flatmode(sbi, vi, &next);
+	}
+	*map = next;
+	EROFS_TRACE_MAP_BLOCKS_EXIT(vi, map, err);
+	return (err);
+}
 static int
 erofs_check_device_range(const struct erofs_sb_info *sbi,
     const struct erofs_device_info *dif, erofs_off_t off, uint64_t len)
