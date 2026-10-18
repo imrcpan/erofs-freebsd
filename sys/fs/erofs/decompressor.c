@@ -85,6 +85,7 @@ static const struct z_erofs_decompressor *const z_erofs_decomp[] = {
 	[Z_EROFS_COMPRESSION_LZ4] = &z_erofs_lz4_decomp,
 	[Z_EROFS_COMPRESSION_LZMA] = &z_erofs_lzma_decomp,
 	[Z_EROFS_COMPRESSION_DEFLATE] = &z_erofs_deflate_decomp,
+	[Z_EROFS_COMPRESSION_ZSTD] = &z_erofs_zstd_decomp,
 };
 
 static int
