@@ -222,8 +222,12 @@ struct erofs_zextent_key {
 };
 
 struct erofs_zextent_cache_metrics {
+	uint64_t hits;
+	uint64_t misses;
+	uint64_t bypasses;
 	uint64_t evictions;
 	uint64_t reclaims;
+	uint64_t waiter_merges;
 	size_t resident_bytes;
 };
 
@@ -240,8 +244,11 @@ struct erofs_zextent_cache_entry {
 };
 
 struct erofs_zextent_cache {
+	struct erofs_zextent_cache_entry entries[EROFS_ZCACHE_MAX_ENTRIES];
 	size_t charged_bytes;
+	size_t budget_bytes;
 	struct erofs_zextent_cache_metrics metrics[Z_EROFS_COMPRESSION_MAX];
+	uint64_t lru_clock;
 	unsigned int entry_count;
 	bool closing;
 };
@@ -328,6 +335,7 @@ struct erofs_sb_info {
 	struct mtx z_extent_cache_lock;
 	struct erofs_zextent_cache z_extent_cache;
 	LIST_ENTRY(erofs_sb_info) z_extent_cache_link;
+	bool z_extent_cache_initialized;
 	struct taskqueue *decompress_taskqueue;
 	struct cv decompress_taskqueue_cv;
 	unsigned int decompress_taskqueue_users;

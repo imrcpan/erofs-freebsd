@@ -16,6 +16,13 @@
 
 #include <fs/erofs/compress.h>
 
+enum z_erofs_cache_lookup {
+	Z_EROFS_CACHE_BYPASS,
+	Z_EROFS_CACHE_HIT,
+	Z_EROFS_CACHE_OWNER,
+	Z_EROFS_CACHE_ERROR,
+};
+
 #define EROFS_ZCACHE_MOUNT_HARD_BUDGET	(256UL * 1024)
 #define EROFS_ZCACHE_GLOBAL_HARD_BUDGET (512UL * 1024)
 #define EROFS_ZCACHE_MIN_DECODE_WORK	(128UL * 1024)
@@ -139,6 +146,180 @@ z_erofs_extent_cache_drop_entry_locked(struct erofs_sb_info *sbi __unused,
 	z_erofs_extent_cache_reset_locked(cache, entry);
 	cv_broadcast(&entry->cv);
 	return (data);
+}
+
+static enum z_erofs_cache_lookup
+z_erofs_extent_cache_claim(struct erofs_sb_info *sbi,
+    const struct erofs_inode *vi, const struct erofs_map_blocks *map,
+    size_t decoded_size, erofs_off_t mapoff, size_t len, void *dst, int *errorp)
+{
+	struct erofs_zextent_cache *cache;
+	struct erofs_zextent_cache_metrics *metrics;
+	struct erofs_zextent_cache_entry *entry, *victim;
+	void *old;
+	enum z_erofs_cache_lookup result;
+	unsigned int i;
+
+	KASSERT(len <= MAXPHYS, ("erofs extent cache copy exceeds MAXPHYS"));
+	KASSERT(mapoff <= decoded_size && len <= decoded_size - mapoff,
+	    ("erofs extent cache copy exceeds decoded extent"));
+	*errorp = 0;
+	if (!sbi->z_extent_cache_initialized)
+		return (Z_EROFS_CACHE_BYPASS);
+	cache = &sbi->z_extent_cache;
+	KASSERT(map->m_algorithmformat < Z_EROFS_COMPRESSION_MAX,
+	    ("erofs decoded cache claim has unknown codec"));
+	metrics = &cache->metrics[map->m_algorithmformat];
+	entry = NULL;
+	victim = NULL;
+	old = NULL;
+	mtx_lock(&sbi->z_extent_cache_lock);
+	if (cache->closing) {
+		++metrics->bypasses;
+		goto bypass;
+	}
+	for (i = 0; i < nitems(cache->entries); ++i) {
+		if (z_erofs_extent_cache_match(&cache->entries[i], vi, map,
+			decoded_size)) {
+			entry = &cache->entries[i];
+			break;
+		}
+	}
+	if (entry != NULL) {
+		if (entry->state == EROFS_ZCACHE_READY) {
+			KASSERT(entry->data != NULL,
+			    ("erofs ready extent cache has no data"));
+			memcpy(dst, (char *)entry->data + (size_t)mapoff, len);
+			entry->lru = ++cache->lru_clock;
+			++metrics->hits;
+			mtx_unlock(&sbi->z_extent_cache_lock);
+			return (Z_EROFS_CACHE_HIT);
+		}
+		if (entry->state == EROFS_ZCACHE_INFLIGHT) {
+			++metrics->waiter_merges;
+			++entry->waiters;
+			do {
+				cv_wait(&entry->cv, &sbi->z_extent_cache_lock);
+			} while (entry->state == EROFS_ZCACHE_INFLIGHT);
+			if (entry->state == EROFS_ZCACHE_READY) {
+				memcpy(dst,
+				    (char *)entry->data + (size_t)mapoff, len);
+				entry->lru = ++cache->lru_clock;
+				++metrics->hits;
+				result = Z_EROFS_CACHE_HIT;
+			} else {
+				KASSERT(entry->state == EROFS_ZCACHE_FAILED &&
+					entry->error > 0,
+				    ("erofs inflight cache has no typed "
+				     "result"));
+				*errorp = entry->error;
+				result = Z_EROFS_CACHE_ERROR;
+			}
+			--entry->waiters;
+			if (entry->state == EROFS_ZCACHE_FAILED &&
+			    entry->waiters == 0)
+				z_erofs_extent_cache_reset_locked(cache, entry);
+			if (entry->waiters == 0)
+				cv_broadcast(&entry->cv);
+			mtx_unlock(&sbi->z_extent_cache_lock);
+			return (result);
+		}
+		if (entry->waiters != 0) {
+			++metrics->bypasses;
+			goto bypass;
+		}
+		z_erofs_extent_cache_reset_locked(cache, entry);
+	}
+	for (i = 0; i < nitems(cache->entries); ++i) {
+		if (!cache->entries[i].active) {
+			entry = &cache->entries[i];
+			break;
+		}
+		if (cache->entries[i].state == EROFS_ZCACHE_READY &&
+		    cache->entries[i].waiters == 0 &&
+		    (victim == NULL || cache->entries[i].lru < victim->lru))
+			victim = &cache->entries[i];
+	}
+	if (entry == NULL && victim != NULL) {
+		entry = victim;
+		old = z_erofs_extent_cache_drop_entry_locked(sbi, cache, entry,
+		    true, false);
+	}
+	if (entry == NULL || decoded_size > cache->budget_bytes ||
+	    cache->charged_bytes > cache->budget_bytes - decoded_size ||
+	    !z_erofs_extent_cache_reserve(decoded_size)) {
+		++metrics->bypasses;
+		goto bypass;
+	}
+	entry->key.map = *map;
+	entry->key.nid = vi->nid;
+	entry->key.decoded_size = decoded_size;
+	entry->charged_bytes = decoded_size;
+	entry->error = 0;
+	entry->state = EROFS_ZCACHE_INFLIGHT;
+	entry->active = true;
+	entry->lru = ++cache->lru_clock;
+	++cache->entry_count;
+	cache->charged_bytes += decoded_size;
+	++metrics->misses;
+	mtx_unlock(&sbi->z_extent_cache_lock);
+	free(old, M_EROFS);
+	return (Z_EROFS_CACHE_OWNER);
+
+bypass:
+	mtx_unlock(&sbi->z_extent_cache_lock);
+	free(old, M_EROFS);
+	return (Z_EROFS_CACHE_BYPASS);
+}
+
+static void
+z_erofs_extent_cache_complete(struct erofs_sb_info *sbi,
+    const struct erofs_inode *vi, const struct erofs_map_blocks *map,
+    size_t decoded_size, void *decoded, int error)
+{
+	struct erofs_zextent_cache *cache;
+	struct erofs_zextent_cache_entry *entry;
+	struct erofs_zextent_cache_metrics *metrics;
+	unsigned int i;
+
+	KASSERT((error == 0) == (decoded != NULL),
+	    ("erofs extent cache completion is untyped"));
+	cache = &sbi->z_extent_cache;
+	mtx_lock(&sbi->z_extent_cache_lock);
+	entry = NULL;
+	for (i = 0; i < nitems(cache->entries); ++i) {
+		if (z_erofs_extent_cache_match(&cache->entries[i], vi, map,
+			decoded_size)) {
+			entry = &cache->entries[i];
+			break;
+		}
+	}
+	KASSERT(entry != NULL && entry->state == EROFS_ZCACHE_INFLIGHT,
+	    ("erofs extent cache owner lost its key"));
+	metrics = &cache->metrics[map->m_algorithmformat];
+	if (error == 0) {
+		KASSERT(entry->charged_bytes == decoded_size,
+		    ("erofs decoded cache success accounting mismatch"));
+		entry->data = decoded;
+		metrics->resident_bytes += decoded_size;
+		entry->error = 0;
+		entry->state = EROFS_ZCACHE_READY;
+		entry->lru = ++cache->lru_clock;
+	} else {
+		KASSERT(error > 0,
+		    ("erofs extent cache published negative errno"));
+		KASSERT(cache->charged_bytes >= entry->charged_bytes,
+		    ("erofs decoded cache accounting underflow"));
+		cache->charged_bytes -= entry->charged_bytes;
+		z_erofs_extent_cache_release(entry->charged_bytes);
+		entry->charged_bytes = 0;
+		entry->error = error;
+		entry->state = EROFS_ZCACHE_FAILED;
+		if (entry->waiters == 0)
+			z_erofs_extent_cache_reset_locked(cache, entry);
+	}
+	cv_broadcast(&entry->cv);
+	mtx_unlock(&sbi->z_extent_cache_lock);
 }
 
 static unsigned int
