@@ -22,6 +22,8 @@
 #include <fs/erofs/internal.h>
 #include <fs/erofs/trace.h>
 
+#define EROFS_DIR_READAHEAD_SLOTS 256
+
 void
 erofs_put_metabuf(struct erofs_buf *buf)
 {
@@ -314,4 +316,87 @@ erofs_map_dev(struct erofs_sb_info *sbi, struct erofs_map_dev *map)
 		    "range %ju+%ju of device %u is not backed by any device",
 		    (uintmax_t)pa, (uintmax_t)plen, deviceid));
 	return (error);
+}
+
+int
+erofs_read_physical(struct erofs_sb_info *sbi, unsigned int device_id,
+    erofs_off_t off, size_t len, void **bufp)
+{
+	struct erofs_map_dev map;
+	erofs_blk_t blocks;
+	int error;
+
+	map = (struct erofs_map_dev) {
+		.m_pa = off,
+		.m_deviceid = device_id,
+		.m_plen = len,
+	};
+	error = erofs_map_dev(sbi, &map);
+	if (error != 0)
+		return (error);
+	blocks = map.m_dif->blocks;
+	if (map.m_dif == &sbi->dif0 && sbi->flatdev)
+		blocks = sbi->flatdev_blocks;
+	return (erofs_bread_device(sbi, map.m_dif, blocks, map.m_pa, len, NULL,
+	    NULL, 0, bufp));
+}
+
+static int
+erofs_read_physical_readahead(struct erofs_sb_info *sbi, unsigned int device_id,
+    erofs_off_t off, size_t len, unsigned int rablocks, void **bufp)
+{
+	struct erofs_map_dev current, future;
+	daddr_t *rablkno;
+	int *rabsize;
+	erofs_off_t device_pa, step;
+	erofs_blk_t blocks;
+	unsigned int count;
+	int error, ret;
+
+	current = (struct erofs_map_dev) {
+		.m_pa = off,
+		.m_deviceid = device_id,
+		.m_plen = len,
+	};
+	error = erofs_map_dev(sbi, &current);
+	if (error != 0)
+		return (error);
+	blocks = current.m_dif->blocks;
+	if (current.m_dif == &sbi->dif0 && sbi->flatdev)
+		blocks = sbi->flatdev_blocks;
+	if (rablocks == 0)
+		return (erofs_bread_device(sbi, current.m_dif, blocks,
+		    current.m_pa, len, NULL, NULL, 0, bufp));
+	/*
+	 * 256 slots are 2 KiB, which is a large part of a kernel stack inside
+	 * the recursive read path, so keep the run lists off the stack.
+	 */
+	rablocks = MIN(rablocks, (unsigned int)EROFS_DIR_READAHEAD_SLOTS);
+	rablkno = malloc(rablocks * sizeof(*rablkno), M_EROFS, M_WAITOK);
+	rabsize = malloc(rablocks * sizeof(*rabsize), M_EROFS, M_WAITOK);
+	for (count = 0; count < rablocks; count++) {
+		step = (erofs_off_t)(count + 1) * sbi->block_size;
+		if (off > UINT64_MAX - step || current.m_pa > UINT64_MAX - step)
+			break;
+		future = (struct erofs_map_dev) {
+			.m_pa = off + step,
+			.m_deviceid = device_id,
+			.m_plen = sbi->block_size,
+		};
+		if (erofs_map_dev(sbi, &future) != 0 ||
+		    future.m_dif != current.m_dif ||
+		    future.m_pa != current.m_pa + step)
+			break;
+		if (__builtin_add_overflow(future.m_dif->fsoff, future.m_pa,
+			&device_pa) ||
+		    device_pa > INT64_MAX)
+			break;
+		rablkno[count] = btodb(device_pa);
+		rabsize[count] = sbi->block_size;
+	}
+	ret = erofs_bread_device(sbi, current.m_dif, blocks, current.m_pa, len,
+	    rablkno, rabsize, count, bufp);
+	free(rabsize, M_EROFS);
+	free(rablkno, M_EROFS);
+	return (ret);
 }

@@ -211,6 +211,7 @@ struct erofs_sb_info {
 	/* Device table */
 	uint16_t extra_devices;
 	bool flatdev;
+	erofs_blk_t flatdev_blocks;
 	struct erofs_device_info *devs;
 };
 
@@ -287,6 +288,8 @@ struct erofs_buf {
 void erofs_put_metabuf(struct erofs_buf *buf);
 int erofs_bread(struct erofs_sb_info *sbi, erofs_off_t off, size_t len,
     void **bufp);
+int erofs_read_physical(struct erofs_sb_info *sbi, unsigned int device_id,
+    erofs_off_t off, size_t len, void **bufp);
 void erofs_brelse(void *buf);
 int erofs_read_metadata_range(struct erofs_sb_info *sbi, erofs_nid_t nid,
     erofs_off_t off, size_t len, struct erofs_buf *buf);
