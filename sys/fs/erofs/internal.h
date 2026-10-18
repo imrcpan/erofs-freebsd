@@ -310,6 +310,7 @@ struct erofs_inode {
 	uint16_t z_idata_size;
 	erofs_off_t z_fragmentoff;
 	uint64_t z_tailextent_headlcn;
+	uint64_t z_extents;
 	/* Chunk-based fields */
 	uint16_t chunkformat;
 	uint8_t chunkbits;

@@ -412,6 +412,48 @@ z_erofs_get_extent_decompressedlen(struct z_erofs_maprecorder *m)
 	return (0);
 }
 
+static inline erofs_off_t
+z_erofs_extent_table_pos(const struct erofs_inode *vi, unsigned int recsz)
+{
+	return (
+	    roundup2(z_erofs_header_pos(vi) + sizeof(struct z_erofs_map_header),
+		recsz));
+}
+
+static inline erofs_off_t
+z_erofs_extent_record_pos(erofs_off_t table_pos, unsigned int recsz,
+    uint64_t index)
+{
+	return (table_pos + index * recsz);
+}
+
+static int
+z_erofs_read_extent(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t pos, unsigned int recsz, struct z_erofs_extent *ext)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	int error;
+
+	bzero(ext, sizeof(*ext));
+	error = erofs_read_metadata_range(sbi, vi->nid, pos, recsz, &buf);
+	if (error != 0)
+		return (error);
+	memcpy(ext, buf.data, recsz);
+	erofs_put_metabuf(&buf);
+	return (0);
+}
+
+static uint64_t
+z_erofs_extent_lstart(const struct z_erofs_extent *ext, unsigned int recsz)
+{
+	uint64_t lstart;
+
+	lstart = le32toh(ext->lstart_lo);
+	if (recsz > offsetof(struct z_erofs_extent, lstart_hi))
+		lstart |= (uint64_t)le32toh(ext->lstart_hi) << 32;
+	return (lstart);
+}
+
 static int
 z_erofs_map_blocks_fo(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct erofs_map_blocks *map, int flags)
@@ -525,5 +567,156 @@ z_erofs_map_blocks_fo(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 			map->m_flags &= ~EROFS_MAP_PARTIAL_MAPPED;
 		return (err);
 	}
+	return (0);
+}
+
+/*
+ * The table is not scanned on load, as it grows with the file.  The search
+ * range checks each record it visits, so a bad table can only give a hole
+ * or the wrong extent.
+ */
+static int
+z_erofs_map_blocks_ext(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct erofs_map_blocks *map)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	struct z_erofs_extent ext;
+	unsigned int recsz, bmask;
+	uint8_t fmt;
+	uint64_t cluster_size, extent_idx;
+	erofs_off_t extent_pos, pos, table_pos;
+	uint64_t lend, l, r, mid, pa, la, lstart;
+	bool interlaced, last;
+	int error;
+
+	interlaced = (vi->z_advise & Z_EROFS_ADVISE_INTERLACED_PCLUSTER) != 0;
+	recsz = z_erofs_extent_recsize(vi->z_advise);
+	table_pos = z_erofs_extent_table_pos(vi, recsz);
+	pos = table_pos;
+	bmask = sbi->block_size - 1;
+	lend = vi->size;
+	cluster_size = 1ULL << vi->z_lclusterbits;
+	map->m_flags = 0;
+
+	if (recsz <= offsetof(struct z_erofs_extent, pstart_hi)) {
+		if (recsz <= offsetof(struct z_erofs_extent, pstart_lo)) {
+			error = erofs_read_metadata_range(sbi, vi->nid, pos,
+			    sizeof(uint64_t), &buf);
+			if (error != 0)
+				return (error);
+			pa = le64dec(buf.data);
+			erofs_put_metabuf(&buf);
+			pos += sizeof(uint64_t);
+			lstart = 0;
+			extent_idx = 0;
+		} else {
+			lstart = rounddown2(map->m_la, cluster_size);
+			extent_idx = lstart >> vi->z_lclusterbits;
+			pa = EROFS_NULL_ADDR;
+		}
+		for (;;) {
+			KASSERT(extent_idx < vi->z_extents,
+			    ("erofs: extent %ju of %ju", (uintmax_t)extent_idx,
+				(uintmax_t)vi->z_extents));
+			extent_pos = z_erofs_extent_record_pos(pos, recsz,
+			    extent_idx);
+			error = z_erofs_read_extent(sbi, vi, extent_pos, recsz,
+			    &ext);
+			if (error != 0)
+				return (error);
+			map->m_plen = le32toh(ext.plen);
+			if (pa != EROFS_NULL_ADDR) {
+				map->m_pa = pa;
+				pa += map->m_plen & Z_EROFS_EXTENT_PLEN_MASK;
+			} else {
+				map->m_pa = le32toh(ext.pstart_lo);
+			}
+			extent_idx++;
+			lstart += cluster_size;
+			if (lstart > map->m_la)
+				break;
+		}
+		last = lstart >= roundup2(lend, cluster_size);
+		lend = MIN(lstart, lend);
+		lstart -= cluster_size;
+	} else {
+		lstart = lend;
+		for (l = 0, r = vi->z_extents; l < r;) {
+			mid = l + (r - l) / 2;
+			extent_pos = z_erofs_extent_record_pos(table_pos, recsz,
+			    mid);
+			error = z_erofs_read_extent(sbi, vi, extent_pos, recsz,
+			    &ext);
+			if (error != 0)
+				return (error);
+			la = z_erofs_extent_lstart(&ext, recsz);
+			pa = le32toh(ext.pstart_lo) |
+			    ((uint64_t)le32toh(ext.pstart_hi) << 32);
+			if (la > map->m_la) {
+				r = mid;
+				/*
+				 * The records are not compared with each
+				 * other, but this one must not start past the
+				 * next one or the size: m_llen stays within the
+				 * file.
+				 */
+				if (la > lend)
+					return (erofs_corrupt(sbi, vi->nid,
+					    "extent %ju starts at %ju, past "
+					    "the following extent or the size "
+					    "%ju",
+					    (uintmax_t)mid, (uintmax_t)la,
+					    (uintmax_t)lend));
+				lend = la;
+			} else {
+				l = mid + 1;
+				if (map->m_la == la)
+					r = MIN(l + 1, r);
+				lstart = la;
+				map->m_plen = le32toh(ext.plen);
+				map->m_pa = pa;
+			}
+		}
+		last = l >= vi->z_extents;
+	}
+
+	if (lstart < lend) {
+		map->m_la = lstart;
+		if (last &&
+		    (vi->z_advise & Z_EROFS_ADVISE_FRAGMENT_PCLUSTER) != 0) {
+			map->m_flags = EROFS_MAP_FRAGMENT;
+			if (recsz >
+			    offsetof(struct z_erofs_extent, pstart_lo)) {
+				vi->z_fragmentoff = map->m_plen |
+				    (map->m_pa << 32);
+			} else {
+				vi->z_fragmentoff = map->m_plen;
+			}
+		} else if ((map->m_plen & Z_EROFS_EXTENT_PLEN_MASK) != 0) {
+			map->m_flags = EROFS_MAP_MAPPED;
+			fmt = (uint8_t)(map->m_plen >>
+			    Z_EROFS_EXTENT_PLEN_FMT_BIT);
+			if ((map->m_plen & Z_EROFS_EXTENT_PLEN_PARTIAL) != 0)
+				map->m_flags |= EROFS_MAP_PARTIAL_REF;
+			map->m_plen &= Z_EROFS_EXTENT_PLEN_MASK;
+			if (fmt != 0) {
+				if (fmt - 1 >= Z_EROFS_COMPRESSION_MAX) {
+					erofs_err(sbi,
+					    "unsupported compression "
+					    "algorithm %u @ nid %ju",
+					    fmt - 1, (uintmax_t)vi->nid);
+					return (EOPNOTSUPP);
+				}
+				map->m_algorithmformat = (uint8_t)(fmt - 1);
+			} else if (interlaced &&
+			    ((map->m_pa | map->m_plen) & bmask) == 0)
+				map->m_algorithmformat =
+				    Z_EROFS_COMPRESSION_INTERLACED;
+			else
+				map->m_algorithmformat =
+				    Z_EROFS_COMPRESSION_SHIFTED;
+		}
+	}
+	map->m_llen = lend - map->m_la;
 	return (0);
 }
