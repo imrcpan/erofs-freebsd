@@ -47,8 +47,18 @@ TUNABLE_ULONG("vfs.erofs.decoded_cache.minimum_decode_work",
     &z_erofs_cache_minimum_decode_work);
 TUNABLE_ULONG("vfs.erofs.decoded_cache.worker_limit",
     &z_erofs_cache_worker_limit);
+
+static struct mtx z_erofs_cache_list_lock;
 static struct mtx z_erofs_cache_budget_lock;
+static LIST_HEAD(, erofs_sb_info) z_erofs_cache_mounts = LIST_HEAD_INITIALIZER(
+    z_erofs_cache_mounts);
 static size_t z_erofs_cache_global_charged;
+static eventhandler_tag z_erofs_cache_lowmem_tag;
+
+MTX_SYSINIT(erofs_zcache_list, &z_erofs_cache_list_lock, "erofs zcache list",
+    MTX_DEF);
+MTX_SYSINIT(erofs_zcache_budget, &z_erofs_cache_budget_lock,
+    "erofs zcache budget", MTX_DEF);
 
 static size_t
 z_erofs_extent_cache_global_limit(void)
@@ -321,6 +331,57 @@ z_erofs_extent_cache_complete(struct erofs_sb_info *sbi,
 	cv_broadcast(&entry->cv);
 	mtx_unlock(&sbi->z_extent_cache_lock);
 }
+
+static void
+z_erofs_extent_cache_lowmem(void *arg __unused, int howto __unused)
+{
+	struct erofs_zextent_cache *cache;
+	struct erofs_sb_info *sbi;
+	void *data[EROFS_ZCACHE_MAX_ENTRIES];
+	unsigned int count, i;
+
+	mtx_lock(&z_erofs_cache_list_lock);
+	LIST_FOREACH(sbi, &z_erofs_cache_mounts, z_extent_cache_link) {
+		count = 0;
+		if (!mtx_trylock(&sbi->z_extent_cache_lock))
+			continue;
+		cache = &sbi->z_extent_cache;
+		for (i = 0; i < nitems(cache->entries); ++i) {
+			if (cache->entries[i].state == EROFS_ZCACHE_READY &&
+			    cache->entries[i].waiters == 0)
+				data[count++] =
+				    z_erofs_extent_cache_drop_entry_locked(sbi,
+					cache, &cache->entries[i], true, true);
+		}
+		mtx_unlock(&sbi->z_extent_cache_lock);
+		while (count != 0)
+			free(data[--count], M_EROFS);
+	}
+	mtx_unlock(&z_erofs_cache_list_lock);
+}
+
+static void
+z_erofs_extent_cache_global_init(void *arg __unused)
+{
+	z_erofs_cache_lowmem_tag = EVENTHANDLER_REGISTER(vm_lowmem,
+	    z_erofs_extent_cache_lowmem, NULL, LOWMEM_PRI_DEFAULT);
+}
+
+static void
+z_erofs_extent_cache_global_fini(void *arg __unused)
+{
+	if (z_erofs_cache_lowmem_tag != NULL)
+		EVENTHANDLER_DEREGISTER(vm_lowmem, z_erofs_cache_lowmem_tag);
+	KASSERT(LIST_EMPTY(&z_erofs_cache_mounts),
+	    ("erofs decoded cache mounts remain at unload"));
+	KASSERT(z_erofs_cache_global_charged == 0,
+	    ("erofs decoded cache bytes remain at unload"));
+}
+
+SYSINIT(erofs_zcache_global, SI_SUB_VFS, SI_ORDER_FIRST,
+    z_erofs_extent_cache_global_init, NULL);
+SYSUNINIT(erofs_zcache_global, SI_SUB_VFS, SI_ORDER_FIRST,
+    z_erofs_extent_cache_global_fini, NULL);
 
 static unsigned int
 z_erofs_decode_worker_count(void)
