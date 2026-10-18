@@ -96,3 +96,214 @@ z_erofs_load_full_lcluster(struct z_erofs_maprecorder *m, uint64_t lcn)
 	erofs_put_metabuf(&buf);
 	return (0);
 }
+
+static unsigned int
+decode_compactedbits(unsigned int lobits, const uint8_t *in, unsigned int pos,
+    uint8_t *type)
+{
+	uint32_t v;
+	unsigned int lo;
+
+	v = le32dec(in + pos / 8) >> (pos & 7);
+	lo = v & ((1U << lobits) - 1);
+	*type = (v >> lobits) & 3;
+	return (lo);
+}
+
+static unsigned int
+get_compacted_la_distance(unsigned int lobits, unsigned int encodebits,
+    unsigned int vcnt, const uint8_t *in, int i)
+{
+	unsigned int lo, d1;
+	uint8_t type;
+
+	d1 = 0;
+	do {
+		lo = decode_compactedbits(lobits, in, encodebits * i, &type);
+		if (type != Z_EROFS_LCLUSTER_TYPE_NONHEAD)
+			return (d1);
+		++d1;
+	} while (++i < (int)vcnt);
+
+	/* vcnt - 1 (Z_EROFS_LCLUSTER_TYPE_NONHEAD) item */
+	if ((lo & Z_EROFS_LI_D0_CBLKCNT) == 0)
+		d1 += lo - 1;
+	return (d1);
+}
+
+static int
+z_erofs_load_compact_lcluster(struct z_erofs_maprecorder *m, uint64_t lcn,
+    bool lookahead)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	struct erofs_inode *vi;
+	erofs_off_t ebase, pos;
+	uint64_t compacted_2b, totalidx, original_lcn;
+	unsigned int compacted_4b_initial, amortizedshift;
+	unsigned int vcnt, lo, lobits, encodebits, nblk, bytes, packsize;
+	bool big_pcluster;
+	uint8_t *in, type;
+	int error, i;
+
+	vi = m->vi;
+	/*
+	 * A compact index entry is 16 bits (4-byte units) or 14 bits (2-byte
+	 * units): a 2-bit type and the offset in the lcluster.  Linux has the
+	 * same limit.
+	 */
+	if (vi->z_lclusterbits > 14)
+		return (erofs_corrupt(m->sbi, vi->nid,
+		    "invalid lcluster bits %u", vi->z_lclusterbits));
+	ebase = z_erofs_header_pos(vi) + sizeof(struct z_erofs_map_header);
+	totalidx = (vi->size + (1ULL << vi->z_lclusterbits) - 1) >>
+	    vi->z_lclusterbits;
+	if (lcn >= totalidx)
+		return (EINVAL);
+
+	original_lcn = lcn;
+	m->lcn = lcn;
+	compacted_4b_initial = ((32 - ebase % 32) / 4) & 7;
+	compacted_2b = 0;
+	if ((vi->z_advise & Z_EROFS_ADVISE_COMPACTED_2B) != 0 &&
+	    compacted_4b_initial < totalidx)
+		compacted_2b = rounddown2(totalidx - compacted_4b_initial, 16);
+
+	pos = ebase;
+	amortizedshift = 2;
+	if (lcn >= compacted_4b_initial) {
+		pos += compacted_4b_initial * 4;
+		lcn -= compacted_4b_initial;
+		if (lcn < compacted_2b) {
+			amortizedshift = 1;
+		} else {
+			pos += compacted_2b * 2;
+			lcn -= compacted_2b;
+		}
+	}
+	pos += lcn << amortizedshift;
+
+	if (amortizedshift == 2 && vi->z_lclusterbits <= 14)
+		vcnt = 2;
+	else if (amortizedshift == 1 && vi->z_lclusterbits <= 12)
+		vcnt = 16;
+	else {
+		erofs_err(m->sbi, "unsupported lcluster bits %u @ nid %ju",
+		    vi->z_lclusterbits, (uintmax_t)vi->nid);
+		return (EOPNOTSUPP);
+	}
+
+	packsize = vcnt << amortizedshift;
+	bytes = pos & (packsize - 1);
+	pos -= bytes;
+	m->nextpackoff = pos + packsize;
+	error = z_erofs_read_index(m, pos, packsize, &buf);
+	if (error != 0)
+		return (error);
+	in = buf.data;
+	lobits = MAX(vi->z_lclusterbits, fls(Z_EROFS_LI_D0_CBLKCNT));
+	encodebits = (packsize - sizeof(uint32_t)) * 8 / vcnt;
+	i = bytes >> amortizedshift;
+
+	lo = decode_compactedbits(lobits, in, encodebits * i, &type);
+	m->type = type;
+	if (type == Z_EROFS_LCLUSTER_TYPE_NONHEAD) {
+		m->clusterofs = 1U << vi->z_lclusterbits;
+		if (lookahead) {
+			m->delta[1] = get_compacted_la_distance(lobits,
+			    encodebits, vcnt, in, i);
+		}
+		big_pcluster = (vi->z_advise & Z_EROFS_ADVISE_BIG_PCLUSTER_1) !=
+		    0;
+		if ((lo & Z_EROFS_LI_D0_CBLKCNT) != 0) {
+			if (!big_pcluster) {
+				erofs_put_metabuf(&buf);
+				return (erofs_corrupt(m->sbi, vi->nid,
+				    "lcn %ju has a compressed block count but "
+				    "the inode has no big pclusters",
+				    (uintmax_t)original_lcn));
+			}
+			m->compressedblks = lo & ~Z_EROFS_LI_D0_CBLKCNT;
+			m->delta[0] = 1;
+		} else if (i + 1 != (int)vcnt) {
+			m->delta[0] = lo;
+		} else {
+			KASSERT(i > 0, ("erofs: pack of %u slots", vcnt));
+			lo = decode_compactedbits(lobits, in,
+			    encodebits * (i - 1), &type);
+			if (type != Z_EROFS_LCLUSTER_TYPE_NONHEAD)
+				lo = 0;
+			else if ((lo & Z_EROFS_LI_D0_CBLKCNT) != 0)
+				lo = 1;
+			m->delta[0] = lo + 1;
+		}
+		erofs_put_metabuf(&buf);
+		return (0);
+	}
+
+	m->clusterofs = lo;
+	m->delta[0] = 0;
+	big_pcluster = (vi->z_advise & Z_EROFS_ADVISE_BIG_PCLUSTER_1) != 0;
+	if (!big_pcluster) {
+		nblk = 1;
+		while (i > 0) {
+			--i;
+			lo = decode_compactedbits(lobits, in, encodebits * i,
+			    &type);
+			if (type == Z_EROFS_LCLUSTER_TYPE_NONHEAD)
+				i -= lo;
+			if (i >= 0)
+				++nblk;
+		}
+	} else {
+		nblk = 0;
+		while (i > 0) {
+			--i;
+			lo = decode_compactedbits(lobits, in, encodebits * i,
+			    &type);
+			if (type == Z_EROFS_LCLUSTER_TYPE_NONHEAD) {
+				if ((lo & Z_EROFS_LI_D0_CBLKCNT) != 0) {
+					--i;
+					nblk += lo & ~Z_EROFS_LI_D0_CBLKCNT;
+					continue;
+				}
+				if (lo <= 1) {
+					erofs_put_metabuf(&buf);
+					return (erofs_corrupt(m->sbi, vi->nid,
+					    "invalid delta %u before lcn %ju",
+					    lo, (uintmax_t)original_lcn));
+				}
+				i -= lo - 2;
+				continue;
+			}
+			++nblk;
+		}
+	}
+	m->pblk = (erofs_blk_t)le32dec(in + packsize - sizeof(uint32_t)) + nblk;
+	erofs_put_metabuf(&buf);
+	m->lcn = original_lcn;
+	return (0);
+}
+
+static int
+z_erofs_load_lcluster_from_disk(struct z_erofs_maprecorder *m, uint64_t lcn,
+    bool lookahead)
+{
+	int err;
+
+	KASSERT(m->vi->datalayout == EROFS_INODE_COMPRESSED_COMPACT ||
+		m->vi->datalayout == EROFS_INODE_COMPRESSED_FULL,
+	    ("erofs: data layout %u is not compressed", m->vi->datalayout));
+	if (m->vi->datalayout == EROFS_INODE_COMPRESSED_COMPACT)
+		err = z_erofs_load_compact_lcluster(m, lcn, lookahead);
+	else
+		err = z_erofs_load_full_lcluster(m, lcn);
+	if (err != 0)
+		return (err);
+	/* The type is a 2-bit field, so it is always below TYPE_MAX. */
+	if (m->type != Z_EROFS_LCLUSTER_TYPE_NONHEAD &&
+	    m->clusterofs >= (1U << m->vi->z_lclusterbits))
+		return (erofs_corrupt(m->sbi, m->vi->nid,
+		    "clusterofs %u of lcn %ju is out of range", m->clusterofs,
+		    (uintmax_t)lcn));
+	return (0);
+}
