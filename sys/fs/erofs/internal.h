@@ -200,7 +200,33 @@ struct erofs_map_blocks {
 	unsigned int m_flags;
 };
 
+#define EROFS_STREAM_CTX_WRAPPER_SIZE 256
+
+struct erofs_stream_ctx;
+typedef void erofs_stream_ctx_fini_t(struct erofs_stream_ctx *ctx);
+
+struct erofs_stream_ctx {
+	STAILQ_ENTRY(erofs_stream_ctx) link;
+	struct erofs_sb_info *sbi;
+	erofs_stream_ctx_fini_t *fini;
+	size_t charged_bytes;
+	uint8_t algorithm;
+	bool cached;
+	bool allocation_failed;
+};
+
+STAILQ_HEAD(erofs_stream_ctx_head, erofs_stream_ctx);
+
+struct erofs_stream_pool_codec {
+	struct erofs_stream_ctx_head idle;
+	unsigned int contexts;
+	unsigned int cached;
+	unsigned int borrowed;
+	unsigned int idle_count;
+};
+
 struct erofs_stream_pool {
+	struct erofs_stream_pool_codec codec[Z_EROFS_COMPRESSION_MAX];
 	size_t resident_bytes;
 	unsigned int waiters;
 	struct cv cv;
@@ -386,6 +412,10 @@ int erofs_lookup(struct vop_cachedlookup_args *ap);
 int z_erofs_fill_inode(struct erofs_sb_info *sbi, struct erofs_inode *vi);
 int z_erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct erofs_map_blocks *map);
+int z_erofs_stream_ctx_charge(struct erofs_stream_ctx *ctx, size_t bytes);
+void z_erofs_stream_ctx_uncharge(struct erofs_stream_ctx *ctx, size_t bytes);
+void *z_erofs_stream_ctx_alloc(struct erofs_stream_ctx *ctx, size_t bytes);
+void z_erofs_stream_ctx_free(struct erofs_stream_ctx *ctx, void *address);
 int z_erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     erofs_off_t loff, size_t len, void **bufp);
 int z_erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
