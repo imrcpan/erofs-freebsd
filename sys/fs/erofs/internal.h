@@ -196,6 +196,7 @@ struct erofs_map_blocks {
 	uint64_t m_plen, m_llen;
 
 	unsigned short m_deviceid;
+	uint8_t m_algorithmformat;
 	unsigned int m_flags;
 };
 
@@ -234,6 +235,8 @@ struct erofs_sb_info {
 		return (                                                     \
 		    (sbi->feature_##compat & EROFS_FEATURE_##feature) != 0); \
 	}
+
+EROFS_FEATURE_FUNCS(lz4_0padding, incompat, INCOMPAT_LZ4_0PADDING)
 EROFS_FEATURE_FUNCS(48bit, incompat, INCOMPAT_48BIT)
 EROFS_FEATURE_FUNCS(metabox, incompat, INCOMPAT_METABOX)
 
@@ -298,6 +301,15 @@ erofs_nid_to_ino64(const struct erofs_sb_info *sbi, erofs_nid_t nid)
 /* Located in metadata. */
 #define EROFS_MAP_META	   0x0002
 #define EROFS_MAP_FRAGMENT 0x0010
+
+enum {
+	Z_EROFS_COMPRESSION_SHIFTED = Z_EROFS_COMPRESSION_MAX,
+	Z_EROFS_COMPRESSION_INTERLACED,
+	Z_EROFS_COMPRESSION_RUNTIME_MAX
+};
+
+_Static_assert(Z_EROFS_COMPRESSION_RUNTIME_MAX <= UINT8_MAX,
+    "algorithm format must fit in uint8_t");
 
 struct erofs_map_dev {
 	struct erofs_device_info *m_dif;
@@ -366,5 +378,8 @@ int z_erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     erofs_off_t loff, size_t len, void **bufp);
 int z_erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct uio *uio);
+int z_erofs_decompress(struct erofs_sb_info *sbi,
+    const struct erofs_map_blocks *map, const void *src, size_t srclen,
+    void *dst, size_t dstlen, bool partial);
 
 #endif /* _FS_EROFS_INTERNAL_H_ */
