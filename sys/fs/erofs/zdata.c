@@ -15,9 +15,131 @@
 #include <sys/uio.h>
 
 #include <fs/erofs/compress.h>
-#define EROFS_ZCACHE_WORKER_HARD_LIMIT EROFS_ZCACHE_MAX_ENTRIES
+
+#define EROFS_ZCACHE_MOUNT_HARD_BUDGET	(256UL * 1024)
+#define EROFS_ZCACHE_GLOBAL_HARD_BUDGET (512UL * 1024)
+#define EROFS_ZCACHE_MIN_DECODE_WORK	(128UL * 1024)
+#define EROFS_ZCACHE_WORKER_HARD_LIMIT	EROFS_ZCACHE_MAX_ENTRIES
+
+static int z_erofs_cache_enabled = 1;
+static unsigned long z_erofs_cache_mount_budget =
+    EROFS_ZCACHE_MOUNT_HARD_BUDGET;
+static unsigned long z_erofs_cache_global_budget =
+    EROFS_ZCACHE_GLOBAL_HARD_BUDGET;
+static unsigned long z_erofs_cache_minimum_decode_work =
+    EROFS_ZCACHE_MIN_DECODE_WORK;
 static unsigned long z_erofs_cache_worker_limit =
     EROFS_ZCACHE_WORKER_HARD_LIMIT;
+
+TUNABLE_INT("vfs.erofs.decoded_cache.enabled", &z_erofs_cache_enabled);
+TUNABLE_ULONG("vfs.erofs.decoded_cache.mount_budget",
+    &z_erofs_cache_mount_budget);
+TUNABLE_ULONG("vfs.erofs.decoded_cache.global_budget",
+    &z_erofs_cache_global_budget);
+TUNABLE_ULONG("vfs.erofs.decoded_cache.minimum_decode_work",
+    &z_erofs_cache_minimum_decode_work);
+TUNABLE_ULONG("vfs.erofs.decoded_cache.worker_limit",
+    &z_erofs_cache_worker_limit);
+static struct mtx z_erofs_cache_budget_lock;
+static size_t z_erofs_cache_global_charged;
+
+static size_t
+z_erofs_extent_cache_global_limit(void)
+{
+	return (
+	    MIN(z_erofs_cache_global_budget, EROFS_ZCACHE_GLOBAL_HARD_BUDGET));
+}
+
+static bool
+z_erofs_extent_cache_reserve(size_t bytes)
+{
+	size_t limit;
+	bool reserved;
+
+	reserved = false;
+	mtx_lock(&z_erofs_cache_budget_lock);
+	limit = z_erofs_extent_cache_global_limit();
+	if (bytes <= limit && z_erofs_cache_global_charged <= limit - bytes) {
+		z_erofs_cache_global_charged += bytes;
+		reserved = true;
+	}
+	mtx_unlock(&z_erofs_cache_budget_lock);
+	return (reserved);
+}
+
+static void
+z_erofs_extent_cache_release(size_t bytes)
+{
+	mtx_lock(&z_erofs_cache_budget_lock);
+	KASSERT(bytes <= z_erofs_cache_global_charged,
+	    ("erofs decoded cache budget underflow"));
+	z_erofs_cache_global_charged -= bytes;
+	mtx_unlock(&z_erofs_cache_budget_lock);
+}
+
+static bool
+z_erofs_extent_cache_match(const struct erofs_zextent_cache_entry *entry,
+    const struct erofs_inode *vi, const struct erofs_map_blocks *map,
+    size_t decoded_size)
+{
+	const struct erofs_zextent_key *key = &entry->key;
+
+	return (entry->active && entry->state != EROFS_ZCACHE_EMPTY &&
+	    key->nid == vi->nid && key->decoded_size == decoded_size &&
+	    key->map.m_pa == map->m_pa && key->map.m_la == map->m_la &&
+	    key->map.m_plen == map->m_plen && key->map.m_llen == map->m_llen &&
+	    key->map.m_deviceid == map->m_deviceid &&
+	    key->map.m_algorithmformat == map->m_algorithmformat &&
+	    key->map.m_flags == map->m_flags);
+}
+
+static void
+z_erofs_extent_cache_reset_locked(struct erofs_zextent_cache *cache,
+    struct erofs_zextent_cache_entry *entry)
+{
+	KASSERT(entry->state != EROFS_ZCACHE_INFLIGHT && entry->waiters == 0,
+	    ("erofs cache entry reset while busy"));
+	if (entry->active) {
+		KASSERT(cache->entry_count != 0,
+		    ("erofs cache entry underflow"));
+		--cache->entry_count;
+	}
+	entry->active = false;
+	entry->state = EROFS_ZCACHE_EMPTY;
+	entry->error = 0;
+	entry->lru = 0;
+	bzero(&entry->key, sizeof(entry->key));
+}
+
+static void *
+z_erofs_extent_cache_drop_entry_locked(struct erofs_sb_info *sbi __unused,
+    struct erofs_zextent_cache *cache, struct erofs_zextent_cache_entry *entry,
+    bool evicted, bool reclaimed)
+{
+	struct erofs_zextent_cache_metrics *metrics;
+	void *data;
+
+	KASSERT(entry->state == EROFS_ZCACHE_READY && entry->waiters == 0,
+	    ("erofs cache drop of busy entry"));
+	data = entry->data;
+	metrics = &cache->metrics[entry->key.map.m_algorithmformat];
+	KASSERT(metrics->resident_bytes >= entry->charged_bytes,
+	    ("erofs decoded cache codec accounting mismatch"));
+	metrics->resident_bytes -= entry->charged_bytes;
+	if (evicted)
+		++metrics->evictions;
+	if (reclaimed)
+		++metrics->reclaims;
+	KASSERT(cache->charged_bytes >= entry->charged_bytes,
+	    ("erofs decoded cache mount accounting underflow"));
+	cache->charged_bytes -= entry->charged_bytes;
+	z_erofs_extent_cache_release(entry->charged_bytes);
+	entry->data = NULL;
+	entry->charged_bytes = 0;
+	z_erofs_extent_cache_reset_locked(cache, entry);
+	cv_broadcast(&entry->cv);
+	return (data);
+}
 
 static unsigned int
 z_erofs_decode_worker_count(void)

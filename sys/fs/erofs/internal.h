@@ -206,10 +206,43 @@ struct erofs_map_blocks {
 	unsigned int m_flags;
 };
 
+enum erofs_zextent_cache_state {
+	EROFS_ZCACHE_EMPTY,
+	EROFS_ZCACHE_INFLIGHT,
+	EROFS_ZCACHE_READY,
+	EROFS_ZCACHE_FAILED,
+};
+
 #define EROFS_ZCACHE_MAX_ENTRIES 8
+
+struct erofs_zextent_key {
+	struct erofs_map_blocks map;
+	erofs_nid_t nid;
+	size_t decoded_size;
+};
+
+struct erofs_zextent_cache_metrics {
+	uint64_t evictions;
+	uint64_t reclaims;
+	size_t resident_bytes;
+};
+
+struct erofs_zextent_cache_entry {
+	struct erofs_zextent_key key;
+	void *data;
+	size_t charged_bytes;
+	unsigned int waiters;
+	int error;
+	enum erofs_zextent_cache_state state;
+	struct cv cv;
+	uint64_t lru;
+	bool active;
+};
 
 struct erofs_zextent_cache {
 	size_t charged_bytes;
+	struct erofs_zextent_cache_metrics metrics[Z_EROFS_COMPRESSION_MAX];
+	unsigned int entry_count;
 	bool closing;
 };
 
