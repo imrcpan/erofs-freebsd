@@ -334,6 +334,12 @@ bool erofs_nid_is_valid(struct erofs_sb_info *sbi, erofs_nid_t nid);
 int erofs_read_inode(struct erofs_sb_info *sbi, erofs_nid_t nid,
     struct erofs_inode *vi);
 
+/* Directory operations. */
+int erofs_dirblock_ndirents(const char *blk, uint32_t maxsize,
+    uint32_t *ndirentsp);
+int erofs_dirent_span(const char *blk, uint32_t maxsize, uint32_t ndirents,
+    uint32_t idx, uint32_t *nameoffp, uint32_t *endoffp);
+
 /* Compressed mapping and data. */
 int z_erofs_fill_inode(struct erofs_sb_info *sbi, struct erofs_inode *vi);
 int z_erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
