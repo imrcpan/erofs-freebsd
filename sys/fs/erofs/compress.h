@@ -24,5 +24,6 @@ struct z_erofs_decompressor {
 
 int z_erofs_lz4_buffer_decompress(const struct z_erofs_decompress_req *rq);
 extern const struct z_erofs_decompressor z_erofs_lz4_decomp;
+extern const struct z_erofs_decompressor z_erofs_deflate_decomp;
 
 #endif
