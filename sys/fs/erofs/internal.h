@@ -208,6 +208,7 @@ struct erofs_sb_info {
 	uint32_t meta_blkaddr;
 	struct erofs_inode *metabox_en;
 	erofs_blk_t blocks;
+	erofs_nid_t root_nid;
 	int64_t epoch;
 	uint32_t fixed_nsec;
 	uint32_t generation_seed;
@@ -343,6 +344,10 @@ int erofs_read_file_source(struct erofs_sb_info *sbi,
 bool erofs_nid_is_valid(struct erofs_sb_info *sbi, erofs_nid_t nid);
 int erofs_read_inode(struct erofs_sb_info *sbi, erofs_nid_t nid,
     struct erofs_inode *vi);
+int erofs_vget_raw(struct mount *mp, erofs_nid_t nid, int flags,
+    struct vnode **vpp);
+int erofs_vget_raw_alloc(struct mount *mp, void *arg, int flags,
+    struct vnode **vpp);
 
 /* Directory operations. */
 int erofs_readdir_block(struct vnode *vp, struct uio *uio, int *eofflag,
@@ -351,6 +356,7 @@ int erofs_dirblock_ndirents(const char *blk, uint32_t maxsize,
     uint32_t *ndirentsp);
 int erofs_dirent_span(const char *blk, uint32_t maxsize, uint32_t ndirents,
     uint32_t idx, uint32_t *nameoffp, uint32_t *endoffp);
+int erofs_lookup(struct vop_cachedlookup_args *ap);
 
 /* Compressed mapping and data. */
 int z_erofs_fill_inode(struct erofs_sb_info *sbi, struct erofs_inode *vi);

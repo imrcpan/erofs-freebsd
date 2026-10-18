@@ -264,3 +264,97 @@ erofs_namei(struct erofs_sb_info *sbi, struct erofs_inode *dir,
 		return (error);
 	return (de != NULL ? 0 : ENOENT);
 }
+
+/*
+ * Directory name lookup (VOP_CACHEDLOOKUP entry point).
+ *
+ * FreeBSD-side API requirements:
+ * - "." must be returned under the caller's requested lock mode;
+ * - ".." must go through vn_vget_ino() to avoid holding a child lock while
+ *   acquiring the parent directory lock in reverse;
+ * - Both hit and miss must correctly update the namecache.
+ */
+int
+erofs_lookup(struct vop_cachedlookup_args *ap)
+{
+	struct erofs_qstr qname;
+	struct vnode *dvp, *vp;
+	struct erofs_inode *dir;
+	struct erofs_sb_info *sbi;
+	struct componentname *cnp;
+	erofs_nid_t nid;
+	int error, ltype;
+
+	dvp = ap->a_dvp;
+	cnp = ap->a_cnp;
+	*ap->a_vpp = NULL;
+	if ((cnp->cn_flags & ISLASTCN) != 0 &&
+	    (cnp->cn_nameiop == DELETE || cnp->cn_nameiop == RENAME))
+		return (EROFS);
+	if (cnp->cn_namelen > EROFS_NAME_LEN)
+		return (ENAMETOOLONG);
+	erofs_trace_lookup(VTOE(dvp), cnp->cn_nameptr, (size_t)cnp->cn_namelen,
+	    (uint32_t)cnp->cn_flags);
+	if (cnp->cn_namelen == 1 && cnp->cn_nameptr[0] == '.') {
+		vref(dvp);
+		ltype = cnp->cn_lkflags & LK_TYPE_MASK;
+		if (ltype != VOP_ISLOCKED(dvp)) {
+			if (ltype == LK_EXCLUSIVE)
+				vn_lock(dvp, LK_UPGRADE | LK_RETRY);
+			else if (ltype == LK_SHARED)
+				vn_lock(dvp, LK_DOWNGRADE | LK_RETRY);
+		}
+		*ap->a_vpp = dvp;
+		return (0);
+	}
+
+	dir = VTOE(dvp);
+	sbi = MTOE(dvp->v_mount);
+	qname.name = (const unsigned char *)cnp->cn_nameptr;
+	qname.end = qname.name + cnp->cn_namelen;
+	error = erofs_namei(sbi, dir, &qname, &nid);
+	if (error != 0) {
+		if (error == ENOENT && (cnp->cn_flags & MAKEENTRY) != 0)
+			cache_enter(dvp, NULL, cnp);
+		if (error == ENOENT && (cnp->cn_flags & ISLASTCN) != 0 &&
+		    cnp->cn_nameiop == CREATE)
+			return (EROFS);
+		return (error);
+	}
+	if ((cnp->cn_flags & ISDOTDOT) != 0 && nid == dir->nid) {
+		if (nid != sbi->root_nid)
+			return (erofs_corrupt(sbi, dir->nid,
+			    "'..' of a non-root directory points to itself"));
+		vref(dvp);
+		ltype = cnp->cn_lkflags & LK_TYPE_MASK;
+		if (ltype != VOP_ISLOCKED(dvp)) {
+			if (ltype == LK_EXCLUSIVE)
+				vn_lock(dvp, LK_UPGRADE | LK_RETRY);
+			else if (ltype == LK_SHARED)
+				vn_lock(dvp, LK_DOWNGRADE | LK_RETRY);
+		}
+		*ap->a_vpp = dvp;
+		return (0);
+	}
+	if ((cnp->cn_flags & ISDOTDOT) == 0 && nid == dir->nid)
+		return (erofs_corrupt(sbi, dir->nid,
+		    "directory contains an entry pointing to itself"));
+
+	if ((cnp->cn_flags & ISDOTDOT) != 0)
+		error = vn_vget_ino_gen(dvp, erofs_vget_raw_alloc, &nid,
+		    cnp->cn_lkflags, &vp);
+	else
+		error = erofs_vget_raw(dvp->v_mount, nid, cnp->cn_lkflags, &vp);
+	if (error != 0)
+		return (error);
+	if ((cnp->cn_flags & ISDOTDOT) != 0 && VTOE(vp)->vtype != VDIR) {
+		vput(vp);
+		return (erofs_corrupt(sbi, dir->nid,
+		    "'..' does not lead to a directory (nid %ju)",
+		    (uintmax_t)nid));
+	}
+	*ap->a_vpp = vp;
+	if ((cnp->cn_flags & MAKEENTRY) != 0)
+		cache_enter(dvp, vp, cnp);
+	return (0);
+}
