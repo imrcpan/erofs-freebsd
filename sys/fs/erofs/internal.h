@@ -253,6 +253,7 @@ struct erofs_sb_info {
 
 	struct erofs_sb_info_opts opt;
 	uint16_t available_compr_algs;
+	uint32_t lzma_dict_size;
 
 	/* Device table */
 	uint16_t extra_devices;
