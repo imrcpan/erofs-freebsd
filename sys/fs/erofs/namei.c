@@ -136,3 +136,131 @@ erofs_read_dirblock(struct erofs_sb_info *sbi, struct erofs_inode *dir,
 	*datasizep = datasize;
 	return (0);
 }
+
+/*
+ * Directory blocks are sorted, so the name can only be in the last block
+ * whose first name is not greater than it.  If that first name is an exact
+ * match, *_ndirents is 0 and the caller need not search the block.  NULL
+ * with *errorp 0 means there is no such block.  The caller releases the
+ * block with erofs_brelse().
+ */
+static char *
+erofs_find_target_block(struct erofs_sb_info *sbi, struct erofs_inode *dir,
+    const struct erofs_qstr *name, uint32_t *_ndirents, uint32_t *_datasize,
+    int *errorp)
+{
+	uint32_t bsz = sbi->block_size;
+	uint64_t head, back;
+	unsigned int startprfx = 0, endprfx = 0;
+	char *candidate = NULL;
+	int error;
+
+	*errorp = 0;
+	*_ndirents = 0;
+	*_datasize = 0;
+
+	if (dir->size == 0)
+		return (NULL);
+
+	head = 0;
+	back = (dir->size - 1) / bsz;
+
+	while (head <= back) {
+		const uint64_t mid = head + (back - head) / 2;
+		uint32_t maxsize;
+		char *blk;
+		int diff;
+		uint32_t ndirents;
+		unsigned int matched;
+		struct erofs_qstr dname;
+
+		error = erofs_read_dirblock(sbi, dir, mid, &blk, &maxsize,
+		    &ndirents);
+		if (error != 0) {
+			*errorp = error;
+			goto out;
+		}
+		error = erofs_dirent_qstr(blk, maxsize, ndirents, 0, &dname);
+		if (error != 0) {
+			erofs_brelse(blk);
+			*errorp = erofs_corrupt(sbi, dir->nid,
+			    "invalid name span of the first dirent in block "
+			    "%ju",
+			    (uintmax_t)mid);
+			goto out;
+		}
+
+		matched = MIN(startprfx, endprfx);
+		/* String comparison without already matched prefix */
+		diff = erofs_dirnamecmp(name, &dname, &matched);
+
+		if (diff < 0) {
+			erofs_brelse(blk);
+			if (mid == 0)
+				break;
+			back = mid - 1;
+			endprfx = matched;
+			continue;
+		}
+
+		/* diff >= 0: this block is a candidate. */
+		if (candidate != NULL)
+			erofs_brelse(candidate);
+		candidate = blk;
+		if (diff == 0) {
+			*_ndirents = 0;
+			*_datasize = maxsize;
+			return (candidate);
+		}
+		head = mid + 1;
+		startprfx = matched;
+		*_ndirents = ndirents;
+		*_datasize = maxsize;
+	}
+	return (candidate);
+out:
+	if (candidate != NULL)
+		erofs_brelse(candidate);
+	return (NULL);
+}
+
+static int
+erofs_namei(struct erofs_sb_info *sbi, struct erofs_inode *dir,
+    const struct erofs_qstr *name, erofs_nid_t *nid)
+{
+	int error;
+	uint32_t ndirents;
+	uint32_t datasize;
+	char *blk;
+	struct erofs_dirent *de;
+
+	blk = erofs_find_target_block(sbi, dir, name, &ndirents, &datasize,
+	    &error);
+	if (blk == NULL)
+		return (error != 0 ? error : ENOENT);
+
+	de = (struct erofs_dirent *)blk;
+	if (ndirents > 0) {
+		error = find_target_dirent(name, blk, datasize, ndirents, &de);
+		if (error != 0)
+			error = erofs_corrupt(sbi, dir->nid,
+			    "invalid name span in a dirent block");
+	}
+
+	if (error == 0 && de != NULL) {
+		erofs_nid_t found_nid;
+
+		found_nid = le64toh(de->nid);
+		if (!erofs_nid_is_valid(sbi, found_nid)) {
+			error = erofs_corrupt(sbi, dir->nid,
+			    "dirent points to invalid nid %ju",
+			    (uintmax_t)found_nid);
+		} else {
+			*nid = found_nid;
+		}
+	}
+	erofs_brelse(blk);
+	if (error != 0)
+		return (error);
+	return (de != NULL ? 0 : ENOENT);
+}
