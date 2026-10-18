@@ -15,6 +15,79 @@
 #include <sys/uio.h>
 
 #include <fs/erofs/compress.h>
+#define EROFS_ZCACHE_WORKER_HARD_LIMIT EROFS_ZCACHE_MAX_ENTRIES
+static unsigned long z_erofs_cache_worker_limit =
+    EROFS_ZCACHE_WORKER_HARD_LIMIT;
+
+static unsigned int
+z_erofs_decode_worker_count(void)
+{
+	unsigned long count;
+
+	count = z_erofs_cache_worker_limit;
+	if (count == 0)
+		count = 1;
+	count = MIN(count, (unsigned long)EROFS_ZCACHE_WORKER_HARD_LIMIT);
+	count = MIN(count, (unsigned long)MAX(1, mp_ncpus));
+	return ((unsigned int)count);
+}
+
+static void
+z_erofs_decode_taskqueue_init(struct erofs_sb_info *sbi __unused)
+{
+	unsigned int worker_count;
+
+	worker_count = z_erofs_decode_worker_count();
+	sbi->decompress_taskqueue = taskqueue_create("erofs decode", M_WAITOK,
+	    taskqueue_thread_enqueue, &sbi->decompress_taskqueue);
+	if (sbi->decompress_taskqueue == NULL)
+		return;
+	if (taskqueue_start_threads_cpuset(&sbi->decompress_taskqueue,
+		(int)worker_count, PWAIT, &all_cpus, "erofs decode") == 0) {
+		sbi->decompress_worker_count = worker_count;
+		sbi->decompress_worker_cpu_bound = true;
+		return;
+	}
+	taskqueue_free(sbi->decompress_taskqueue);
+	sbi->decompress_taskqueue = taskqueue_create("erofs decode", M_WAITOK,
+	    taskqueue_thread_enqueue, &sbi->decompress_taskqueue);
+	if (sbi->decompress_taskqueue == NULL)
+		return;
+	if (taskqueue_start_threads(&sbi->decompress_taskqueue,
+		(int)worker_count, PWAIT, "erofs decode") != 0) {
+		taskqueue_free(sbi->decompress_taskqueue);
+		sbi->decompress_taskqueue = NULL;
+		return;
+	}
+	sbi->decompress_worker_count = worker_count;
+}
+
+static struct taskqueue *
+z_erofs_decode_taskqueue_acquire(struct erofs_sb_info *sbi)
+{
+	struct taskqueue *taskqueue;
+
+	mtx_lock(&sbi->z_extent_cache_lock);
+	if (sbi->z_extent_cache.closing || sbi->decompress_taskqueue == NULL) {
+		taskqueue = NULL;
+	} else {
+		taskqueue = sbi->decompress_taskqueue;
+		++sbi->decompress_taskqueue_users;
+	}
+	mtx_unlock(&sbi->z_extent_cache_lock);
+	return (taskqueue);
+}
+
+static void
+z_erofs_decode_taskqueue_release(struct erofs_sb_info *sbi)
+{
+	mtx_lock(&sbi->z_extent_cache_lock);
+	KASSERT(sbi->decompress_taskqueue_users != 0,
+	    ("erofs decode taskqueue user underflow"));
+	if (--sbi->decompress_taskqueue_users == 0)
+		cv_broadcast(&sbi->decompress_taskqueue_cv);
+	mtx_unlock(&sbi->z_extent_cache_lock);
+}
 
 static void
 z_erofs_decode_length(const struct erofs_map_blocks *map, erofs_off_t mapoff,
@@ -76,4 +149,94 @@ z_erofs_decode_extent(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 	}
 	*bufp = decoded;
 	return (0);
+}
+
+static void
+z_erofs_decode_task_run(void *context, int pending __unused)
+{
+	struct erofs_decompress_task *task = context;
+
+	task->error = z_erofs_decode_extent(task->sbi, task->vi, &task->map,
+	    task->decoded_len, task->partial, &task->decoded);
+	mtx_lock(&task->lock);
+	atomic_add_64(&task->sbi->decompress_worker_runs, 1);
+	task->done = true;
+	cv_signal(&task->cv);
+	mtx_unlock(&task->lock);
+}
+
+static uint8_t
+z_erofs_decode_queue_priority(struct erofs_sb_info *sbi)
+{
+	uint8_t priority;
+
+	mtx_lock(&sbi->control_lock);
+	priority = sbi->decompress_queue_priority;
+	mtx_unlock(&sbi->control_lock);
+	return (priority);
+}
+
+int
+z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
+    struct erofs_inode *vi, struct erofs_map_blocks *map, size_t decoded_len,
+    bool partial, void **bufp)
+{
+	struct erofs_decompress_task *task;
+	struct taskqueue *taskqueue;
+	int error;
+	uint8_t queue_priority;
+	bool queued;
+
+	if (sbi->sync_decompress != EROFS_SYNC_DECOMPRESS_FORCE_OFF)
+		return (z_erofs_decode_extent(sbi, vi, map, decoded_len,
+		    partial, bufp));
+	taskqueue = z_erofs_decode_taskqueue_acquire(sbi);
+	if (taskqueue == NULL) {
+		atomic_add_64(&sbi->decompress_queue_fallbacks, 1);
+		return (z_erofs_decode_extent(sbi, vi, map, decoded_len,
+		    partial, bufp));
+	}
+	/*
+	 * A decode worker can get here again: reading the inline input of a
+	 * metabox inode reads the (compressed) metabox.  Waiting for another
+	 * task from inside a worker could use up every worker, so decode in
+	 * place.
+	 */
+	if (taskqueue_member(taskqueue, curthread)) {
+		z_erofs_decode_taskqueue_release(sbi);
+		atomic_add_64(&sbi->decompress_queue_fallbacks, 1);
+		return (z_erofs_decode_extent(sbi, vi, map, decoded_len,
+		    partial, bufp));
+	}
+	task = malloc(sizeof(*task), M_EROFS, M_WAITOK | M_ZERO);
+	task->sbi = sbi;
+	task->vi = vi;
+	task->map = *map;
+	task->decoded_len = decoded_len;
+	task->partial = partial;
+	mtx_init(&task->lock, "erofs decomp task", NULL, MTX_DEF);
+	cv_init(&task->cv, "erofs decomp task");
+	queue_priority = z_erofs_decode_queue_priority(sbi);
+	TASK_INIT(&task->task, queue_priority, z_erofs_decode_task_run, task);
+	error = taskqueue_enqueue(taskqueue, &task->task);
+	queued = error == 0;
+	if (queued) {
+		atomic_add_64(&sbi->decompress_submissions, 1);
+		mtx_lock(&task->lock);
+		while (!task->done)
+			cv_wait(&task->cv, &task->lock);
+		mtx_unlock(&task->lock);
+		taskqueue_drain(taskqueue, &task->task);
+		error = task->error;
+		*bufp = task->decoded;
+	} else {
+		atomic_add_64(&sbi->decompress_queue_fallbacks, 1);
+		error = z_erofs_decode_extent(sbi, vi, map, decoded_len,
+		    partial, bufp);
+	}
+	cv_destroy(&task->cv);
+	mtx_destroy(&task->lock);
+	free(task, M_EROFS);
+	z_erofs_decode_taskqueue_release(sbi);
+	return (error);
 }

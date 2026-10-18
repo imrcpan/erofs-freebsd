@@ -155,6 +155,12 @@ struct erofs_sb_info_opts {
 	unsigned int mount_opt;
 };
 
+enum erofs_sync_decompress {
+	EROFS_SYNC_DECOMPRESS_AUTO,
+	EROFS_SYNC_DECOMPRESS_FORCE_ON,
+	EROFS_SYNC_DECOMPRESS_FORCE_OFF,
+};
+
 struct erofs_device_handle;
 
 enum erofs_source_kind {
@@ -200,6 +206,27 @@ struct erofs_map_blocks {
 	unsigned int m_flags;
 };
 
+#define EROFS_ZCACHE_MAX_ENTRIES 8
+
+struct erofs_zextent_cache {
+	size_t charged_bytes;
+	bool closing;
+};
+
+struct erofs_decompress_task {
+	struct task task;
+	struct mtx lock;
+	struct cv cv;
+	struct erofs_sb_info *sbi;
+	struct erofs_inode *vi;
+	struct erofs_map_blocks map;
+	size_t decoded_len;
+	bool partial;
+	void *decoded;
+	int error;
+	bool done;
+};
+
 #define EROFS_STREAM_CTX_WRAPPER_SIZE 256
 
 struct erofs_stream_ctx;
@@ -237,6 +264,7 @@ struct erofs_stream_pool {
 struct erofs_sb_info {
 	struct mount *mnt;
 	struct erofs_device_info dif0;
+	struct mtx control_lock;
 
 	uint32_t block_size;
 	uint32_t sb_size;
@@ -256,6 +284,7 @@ struct erofs_sb_info {
 	uint16_t available_compr_algs;
 	uint32_t lzma_dict_size;
 	uint8_t zstd_windowlog;
+	unsigned int sync_decompress;
 
 	/* Device table */
 	uint16_t extra_devices;
@@ -263,6 +292,18 @@ struct erofs_sb_info {
 	bool flatdev;
 	erofs_blk_t flatdev_blocks;
 	struct erofs_device_info *devs;
+	struct mtx z_extent_cache_lock;
+	struct erofs_zextent_cache z_extent_cache;
+	LIST_ENTRY(erofs_sb_info) z_extent_cache_link;
+	struct taskqueue *decompress_taskqueue;
+	struct cv decompress_taskqueue_cv;
+	unsigned int decompress_taskqueue_users;
+	unsigned int decompress_worker_count;
+	bool decompress_worker_cpu_bound;
+	uint8_t decompress_queue_priority;
+	uint64_t decompress_submissions;
+	uint64_t decompress_worker_runs;
+	uint64_t decompress_queue_fallbacks;
 	struct erofs_stream_pool stream_pool;
 	LIST_ENTRY(erofs_sb_info) stream_pool_link;
 	bool stream_pool_initialized;
@@ -457,6 +498,9 @@ int z_erofs_decompress(struct erofs_sb_info *sbi,
 int z_erofs_decode_extent(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct erofs_map_blocks *map, size_t decoded_len, bool partial,
     void **bufp);
+int z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
+    struct erofs_inode *vi, struct erofs_map_blocks *map, size_t decoded_len,
+    bool partial, void **bufp);
 
 /* Compression configuration. */
 int z_erofs_parse_cfgs(struct erofs_sb_info *sbi,
