@@ -203,6 +203,7 @@ struct erofs_map_blocks {
 #define EROFS_STREAM_CTX_WRAPPER_SIZE 256
 
 struct erofs_stream_ctx;
+typedef int erofs_stream_ctx_init_t(struct erofs_stream_ctx *ctx);
 typedef void erofs_stream_ctx_fini_t(struct erofs_stream_ctx *ctx);
 
 struct erofs_stream_ctx {
@@ -261,6 +262,7 @@ struct erofs_sb_info {
 	struct erofs_device_info *devs;
 	struct erofs_stream_pool stream_pool;
 	LIST_ENTRY(erofs_sb_info) stream_pool_link;
+	bool stream_pool_initialized;
 };
 
 #define MTOE(mp) ((struct erofs_sb_info *)(mp)->mnt_data)
@@ -412,6 +414,10 @@ int erofs_lookup(struct vop_cachedlookup_args *ap);
 int z_erofs_fill_inode(struct erofs_sb_info *sbi, struct erofs_inode *vi);
 int z_erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct erofs_map_blocks *map);
+int z_erofs_stream_ctx_get(struct erofs_sb_info *sbi, uint8_t algorithm,
+    size_t context_size, erofs_stream_ctx_init_t *init,
+    erofs_stream_ctx_fini_t *fini, struct erofs_stream_ctx **ctxp);
+void z_erofs_stream_ctx_put(struct erofs_stream_ctx *ctx, bool reusable);
 int z_erofs_stream_ctx_charge(struct erofs_stream_ctx *ctx, size_t bytes);
 void z_erofs_stream_ctx_uncharge(struct erofs_stream_ctx *ctx, size_t bytes);
 void *z_erofs_stream_ctx_alloc(struct erofs_stream_ctx *ctx, size_t bytes);

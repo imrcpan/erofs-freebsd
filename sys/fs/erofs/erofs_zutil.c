@@ -348,3 +348,171 @@ erofs_stream_ctx_destroy(struct erofs_stream_ctx *ctx)
 	erofs_stream_wake_locked(sbi);
 	mtx_unlock(&erofs_stream_lock);
 }
+
+/*
+ * Sleep until a context or budget is released.  Limits that only this mount
+ * can release are waited for on the mount cv; anything involving a global
+ * limit is waited for on the global cv, which every release also signals.
+ */
+static void
+erofs_stream_wait_locked(struct erofs_sb_info *sbi, bool global)
+{
+	struct erofs_stream_pool *pool;
+
+	mtx_assert(&erofs_stream_lock, MA_OWNED);
+	pool = &sbi->stream_pool;
+	++pool->waiters;
+	++erofs_stream_waits;
+	if (global) {
+		++erofs_stream_global_waiters;
+		cv_wait(&erofs_stream_global_cv, &erofs_stream_lock);
+		--erofs_stream_global_waiters;
+	} else {
+		cv_wait(&pool->cv, &erofs_stream_lock);
+	}
+	KASSERT(pool->waiters != 0, ("erofs stream waiter underflow"));
+	--pool->waiters;
+	if (pool->closing)
+		cv_broadcast(&pool->cv);
+}
+
+int
+z_erofs_stream_ctx_get(struct erofs_sb_info *sbi, uint8_t algorithm,
+    size_t context_size, erofs_stream_ctx_init_t *init,
+    erofs_stream_ctx_fini_t *fini, struct erofs_stream_ctx **ctxp)
+{
+	struct erofs_stream_pool_codec *codec;
+	struct erofs_stream_ctx *ctx;
+	bool cached, global_full, mount_full, reserved __diagused;
+	int error;
+
+	*ctxp = NULL;
+	if (algorithm == Z_EROFS_COMPRESSION_LZ4 ||
+	    algorithm >= Z_EROFS_COMPRESSION_MAX ||
+	    context_size < sizeof(*ctx) ||
+	    context_size > EROFS_STREAM_CTX_WRAPPER_SIZE)
+		return (EINVAL);
+	mtx_lock(&erofs_stream_lock);
+	for (;;) {
+		if (!sbi->stream_pool_initialized || sbi->stream_pool.closing) {
+			mtx_unlock(&erofs_stream_lock);
+			return (ENXIO);
+		}
+		codec = &sbi->stream_pool.codec[algorithm];
+		ctx = STAILQ_FIRST(&codec->idle);
+		if (ctx != NULL) {
+			STAILQ_REMOVE_HEAD(&codec->idle, link);
+			KASSERT(codec->idle_count != 0 &&
+				erofs_stream_idle_contexts != 0,
+			    ("erofs stream idle accounting underflow"));
+			--codec->idle_count;
+			--erofs_stream_idle_contexts;
+			++codec->borrowed;
+			++erofs_stream_borrowed_contexts;
+			++erofs_stream_reuses;
+			ctx->allocation_failed = false;
+			mtx_unlock(&erofs_stream_lock);
+			*ctxp = ctx;
+			return (0);
+		}
+		/*
+		 * Limits that no release can ever satisfy are configuration
+		 * errors; waiting for them would never end.
+		 */
+		if (erofs_stream_mount_contexts == 0 ||
+		    erofs_stream_global_contexts_limit == 0 ||
+		    EROFS_STREAM_CTX_WRAPPER_SIZE > erofs_stream_mount_budget ||
+		    EROFS_STREAM_CTX_WRAPPER_SIZE >
+			erofs_stream_global_budget) {
+			++erofs_stream_exhaustions;
+			mtx_unlock(&erofs_stream_lock);
+			return (ENOMEM);
+		}
+		mount_full = codec->contexts >=
+		    (unsigned int)erofs_stream_mount_contexts;
+		global_full = erofs_stream_global_contexts >=
+			(unsigned int)erofs_stream_global_contexts_limit ||
+		    !erofs_stream_global_budget_available_locked(
+			EROFS_STREAM_CTX_WRAPPER_SIZE);
+		if (!mount_full && !global_full &&
+		    erofs_stream_mount_budget_available_locked(sbi,
+			EROFS_STREAM_CTX_WRAPPER_SIZE))
+			break;
+		/*
+		 * Contexts of this codec are all borrowed when mount_full, so
+		 * only a release can help.  Otherwise idle contexts of other
+		 * codecs (or mounts, for a global limit) hold the resource and
+		 * are never released unless reclaimed here.
+		 */
+		if (!mount_full) {
+			ctx = erofs_stream_take_reclaimable_locked(sbi,
+			    global_full);
+			if (ctx != NULL) {
+				mtx_unlock(&erofs_stream_lock);
+				erofs_stream_ctx_destroy(ctx);
+				mtx_lock(&erofs_stream_lock);
+				continue;
+			}
+		}
+		erofs_stream_wait_locked(sbi, !mount_full && global_full);
+	}
+	reserved = erofs_stream_reserve_locked(sbi,
+	    EROFS_STREAM_CTX_WRAPPER_SIZE);
+	KASSERT(reserved, ("erofs stream wrapper reservation failed"));
+	cached = codec->cached < (unsigned int)erofs_stream_mount_cached &&
+	    erofs_stream_global_cached_by_codec[algorithm] <
+		(unsigned int)erofs_stream_global_cached;
+	++codec->contexts;
+	++codec->borrowed;
+	++erofs_stream_global_contexts;
+	++erofs_stream_borrowed_contexts;
+	if (cached) {
+		++codec->cached;
+		++erofs_stream_global_cached_by_codec[algorithm];
+		++erofs_stream_cached_contexts;
+	} else {
+		++erofs_stream_fallbacks;
+	}
+	mtx_unlock(&erofs_stream_lock);
+
+	ctx = uma_zalloc(erofs_stream_zone, M_WAITOK | M_ZERO);
+	ctx->sbi = sbi;
+	ctx->fini = fini;
+	ctx->charged_bytes = EROFS_STREAM_CTX_WRAPPER_SIZE;
+	ctx->algorithm = algorithm;
+	ctx->cached = cached;
+	error = init(ctx);
+	if (error != 0) {
+		erofs_stream_ctx_destroy(ctx);
+		return (error > 0 ? error : EIO);
+	}
+	mtx_lock(&erofs_stream_lock);
+	++erofs_stream_creations;
+	mtx_unlock(&erofs_stream_lock);
+	*ctxp = ctx;
+	return (0);
+}
+
+void
+z_erofs_stream_ctx_put(struct erofs_stream_ctx *ctx, bool reusable)
+{
+	struct erofs_stream_pool_codec *codec;
+
+	mtx_lock(&erofs_stream_lock);
+	codec = &ctx->sbi->stream_pool.codec[ctx->algorithm];
+	if (reusable && ctx->cached && !ctx->sbi->stream_pool.closing) {
+		KASSERT(codec->borrowed != 0 &&
+			erofs_stream_borrowed_contexts != 0,
+		    ("erofs stream borrowed accounting underflow"));
+		--codec->borrowed;
+		--erofs_stream_borrowed_contexts;
+		STAILQ_INSERT_HEAD(&codec->idle, ctx, link);
+		++codec->idle_count;
+		++erofs_stream_idle_contexts;
+		erofs_stream_wake_locked(ctx->sbi);
+		mtx_unlock(&erofs_stream_lock);
+		return;
+	}
+	mtx_unlock(&erofs_stream_lock);
+	erofs_stream_ctx_destroy(ctx);
+}
