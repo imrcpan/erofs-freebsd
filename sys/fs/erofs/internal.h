@@ -282,6 +282,16 @@ erofs_nid_in_metabox(erofs_nid_t nid)
 	return ((nid & BIT_ULL(EROFS_DIRENT_NID_METABOX_BIT)) != 0);
 }
 
+static inline uint64_t
+erofs_nid_to_ino64(const struct erofs_sb_info *sbi, erofs_nid_t nid)
+{
+	if (!erofs_sb_has_metabox(sbi))
+		return (nid);
+	return ((nid << 1) & 0xffffffff00000000ULL) |
+	    (nid & 0x000000007fffffffULL) |
+	    ((nid >> EROFS_DIRENT_NID_METABOX_BIT) << 31);
+}
+
 /* Allocated on disk at m_pa. */
 #define EROFS_MAP_MAPPED 0x0001
 /* Located in metadata. */
