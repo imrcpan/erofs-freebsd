@@ -345,6 +345,8 @@ int erofs_read_inode(struct erofs_sb_info *sbi, erofs_nid_t nid,
     struct erofs_inode *vi);
 
 /* Directory operations. */
+int erofs_readdir_block(struct vnode *vp, struct uio *uio, int *eofflag,
+    int *ncookies, uint64_t **cookies);
 int erofs_dirblock_ndirents(const char *blk, uint32_t maxsize,
     uint32_t *ndirentsp);
 int erofs_dirent_span(const char *blk, uint32_t maxsize, uint32_t ndirents,

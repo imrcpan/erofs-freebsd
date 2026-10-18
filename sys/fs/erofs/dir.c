@@ -231,3 +231,133 @@ erofs_fill_dentries(struct erofs_sb_info *sbi, erofs_nid_t dirnid,
 	}
 	return (0);
 }
+
+/*
+ * Cookies are logical directory offsets, so a read can resume at any entry.
+ * A dot_omitted directory gets "." last, which keeps those offsets stable.
+ */
+int
+erofs_readdir_block(struct vnode *vp, struct uio *uio, int *eofflag,
+    int *ncookies, uint64_t **cookies)
+{
+	struct erofs_inode *dir;
+	struct erofs_sb_info *sbi;
+	struct erofs_uiodir uiodir;
+	struct dirent d;
+	uint64_t *cookiebuf;
+	size_t cookie_count;
+	char *blk;
+	erofs_off_t block_off;
+	uint64_t logical_off;
+	uint32_t block_pos, blksz, ndirents, start_idx, maxsize;
+	bool sequential;
+	int error;
+
+	dir = VTOE(vp);
+	sbi = MTOE(vp->v_mount);
+	blksz = sbi->block_size;
+	error = 0;
+	cookiebuf = NULL;
+	cookie_count = 0;
+	uiodir.eofflag = 0;
+	uiodir.acookies = 0;
+	uiodir.dirent = &d;
+	uiodir.cookies = NULL;
+	uiodir.ncookies = 0;
+	if (cookies != NULL && ncookies != NULL) {
+		*cookies = NULL;
+		*ncookies = 0;
+		if (uio->uio_resid > 0) {
+			cookie_count = (size_t)uio->uio_resid /
+			    GENERIC_MINDIRSIZ;
+			cookie_count = MIN(cookie_count, (size_t)INT_MAX);
+		}
+		uiodir.ncookies = (int)cookie_count;
+		if (cookie_count != 0)
+			cookiebuf = malloc(sizeof(*cookiebuf) * cookie_count,
+			    M_TEMP, M_WAITOK);
+		uiodir.cookies = cookiebuf;
+	}
+
+	if (uio->uio_offset < 0) {
+		error = EINVAL;
+		goto out;
+	}
+	if (dir->dot_omitted && dir->size == (uint64_t)OFF_MAX) {
+		error = erofs_corrupt(sbi, dir->nid,
+		    "directory size leaves no room for '.'");
+		goto out;
+	}
+
+	logical_off = uio->uio_offset;
+	sequential = logical_off == 0;
+	uiodir.last_cookie = logical_off;
+	uio->uio_offset = logical_off;
+
+	while (logical_off < dir->size) {
+		block_off = rounddown2(logical_off, (uint64_t)blksz);
+		maxsize = MIN((uint64_t)blksz, dir->size - block_off);
+		block_pos = logical_off - block_off;
+		if ((block_pos % sizeof(struct erofs_dirent)) != 0) {
+			block_pos = roundup(block_pos,
+			    sizeof(struct erofs_dirent));
+			logical_off = block_off + block_pos;
+			uio->uio_offset = logical_off;
+		}
+		error = erofs_read_data_readahead(sbi, dir, block_off, maxsize,
+		    sequential, (void **)&blk);
+		if (error != 0)
+			goto out;
+		error = erofs_dirblock_ndirents(blk, maxsize, &ndirents);
+		if (error != 0) {
+			erofs_brelse(blk);
+			error = erofs_corrupt(sbi, dir->nid,
+			    "invalid dirent array in the block at offset %ju",
+			    (uintmax_t)block_off);
+			goto out;
+		}
+		start_idx = block_pos / sizeof(struct erofs_dirent);
+		if (start_idx >= ndirents) {
+			logical_off = block_off + maxsize;
+			uio->uio_offset = logical_off;
+			erofs_brelse(blk);
+			continue;
+		}
+		error = erofs_fill_dentries(sbi, dir->nid, &uiodir, uio, &d,
+		    blk, maxsize, start_idx, ndirents, block_off, &logical_off);
+		erofs_brelse(blk);
+		if (error != 0)
+			goto out;
+	}
+	if (dir->dot_omitted && logical_off == dir->size) {
+		bzero(&d, sizeof(d));
+		d.d_fileno = erofs_nid_to_ino64(sbi, dir->nid);
+		d.d_type = DT_DIR;
+		d.d_namlen = 1;
+		d.d_reclen = GENERIC_DIRSIZ(&d);
+		d.d_off = dir->size + 1;
+		d.d_name[0] = '.';
+		d.d_name[1] = '\0';
+		error = erofs_uiodir(&uiodir, d.d_reclen, uio, d.d_off);
+		if (error != 0)
+			goto out;
+		logical_off++;
+		uio->uio_offset = logical_off;
+	}
+	uiodir.eofflag = 1;
+out:
+	if (error == EROFS_UIODIR_BUFFER_FULL)
+		error = 0;
+	if (eofflag != NULL && error == 0)
+		*eofflag = uiodir.eofflag;
+	if (cookies != NULL && ncookies != NULL) {
+		if (error != 0) {
+			if (cookiebuf != NULL)
+				free(cookiebuf, M_TEMP);
+		} else {
+			*ncookies = uiodir.acookies;
+			*cookies = cookiebuf;
+		}
+	}
+	return (error);
+}
