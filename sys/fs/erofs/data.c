@@ -716,3 +716,154 @@ erofs_read_data_readahead(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 		erofs_record_dir_readahead(sbi, rablocks);
 	return (error);
 }
+
+static int
+erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct uio *uio)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	struct erofs_map_blocks map;
+	void *blk;
+	erofs_off_t mapoff, physical;
+	size_t want, chunk;
+	int error;
+
+	if (uio->uio_offset < 0)
+		return (EINVAL);
+	if ((uint64_t)uio->uio_offset >= vi->size)
+		return (0);
+	EROFS_TRACE_READ_FOLIO(vi, (uint64_t)uio->uio_offset,
+	    (uint64_t)uio->uio_resid,
+	    !erofs_inode_is_data_compressed(vi->datalayout));
+
+	/* Compressed file path */
+	if (erofs_inode_is_data_compressed(vi->datalayout))
+		return (z_erofs_read_uio(sbi, vi, uio));
+
+	/* Uncompressed file path */
+	while (uio->uio_resid > 0 && (uint64_t)uio->uio_offset < vi->size) {
+		map = (struct erofs_map_blocks) { .m_la = uio->uio_offset };
+		error = erofs_map_blocks(sbi, vi, &map);
+		if (error != 0)
+			return (error);
+		if (map.m_llen == 0 || map.m_la > (uint64_t)uio->uio_offset ||
+		    (uint64_t)uio->uio_offset - map.m_la >= map.m_llen)
+			return (erofs_corrupt(sbi, vi->nid,
+			    "mapping of offset %jd is empty or does not cover "
+			    "it",
+			    (intmax_t)uio->uio_offset));
+		mapoff = (uint64_t)uio->uio_offset - map.m_la;
+		want = MIN((size_t)MIN(map.m_llen - mapoff, (uint64_t)MAXPHYS),
+		    (size_t)uio->uio_resid);
+		if ((map.m_flags & EROFS_MAP_MAPPED) == 0) {
+			chunk = want;
+			while (chunk > 0) {
+				size_t zlen = MIN(chunk, ZERO_REGION_SIZE);
+
+				error = uiomove(__DECONST(void *, zero_region),
+				    zlen, uio);
+				if (error != 0)
+					return (error);
+				chunk -= zlen;
+			}
+			continue;
+		}
+		if ((map.m_flags & EROFS_MAP_META) != 0) {
+			if (mapoff > UINT64_MAX - map.m_pa)
+				return (EOVERFLOW);
+			physical = map.m_pa + mapoff;
+			error = erofs_read_metadata_range(sbi, vi->nid,
+			    physical, want, &buf);
+		} else {
+			if (mapoff > UINT64_MAX - map.m_pa)
+				return (EOVERFLOW);
+			physical = map.m_pa + mapoff;
+			error = erofs_read_physical(sbi, map.m_deviceid,
+			    physical, want, &blk);
+		}
+		if (error != 0)
+			return (error);
+		if ((map.m_flags & EROFS_MAP_META) != 0) {
+			error = uiomove(buf.data, want, uio);
+			erofs_put_metabuf(&buf);
+		} else {
+			error = uiomove(blk, want, uio);
+			erofs_brelse(blk);
+		}
+		if (error != 0)
+			return (error);
+	}
+	return (0);
+}
+
+/* Read regular file data. */
+int
+erofs_read_file(struct vnode *vp, struct uio *uio)
+{
+	return (erofs_read_uio(MTOE(vp->v_mount), VTOE(vp), uio));
+}
+
+int
+erofs_file_llseek(struct vnode *vp, off_t *offset, bool seek_data)
+{
+	struct erofs_sb_info *sbi;
+	struct erofs_inode *vi;
+	struct erofs_map_blocks map;
+	erofs_off_t pos, end;
+	bool data;
+	int error;
+
+	if (vp->v_type != VREG)
+		return (ENOTTY);
+	vi = VTOE(vp);
+	if (*offset < 0 || (uint64_t)*offset >= vi->size)
+		return (ENXIO);
+
+	sbi = MTOE(vp->v_mount);
+	pos = (erofs_off_t)*offset;
+	while (pos < vi->size) {
+		map = (struct erofs_map_blocks) { .m_la = pos };
+		error = erofs_map_blocks(sbi, vi, &map);
+		if (error != 0)
+			return (error);
+		if (map.m_la > pos || map.m_llen == 0 ||
+		    map.m_la > UINT64_MAX - map.m_llen) {
+			return (erofs_corrupt(sbi, vi->nid,
+			    "mapping of offset %ju is empty or does not cover "
+			    "it",
+			    (uintmax_t)pos));
+		}
+		end = map.m_la + map.m_llen;
+		if (pos >= end)
+			return (erofs_corrupt(sbi, vi->nid,
+			    "mapping of offset %ju ends at %ju", (uintmax_t)pos,
+			    (uintmax_t)end));
+		data = (map.m_flags &
+			   (EROFS_MAP_MAPPED | EROFS_MAP_FRAGMENT)) != 0;
+		if (data == seek_data) {
+			*offset = (off_t)pos;
+			return (0);
+		}
+		pos = MIN(end, vi->size);
+	}
+
+	if (seek_data)
+		return (ENXIO);
+	if (vi->size > OFF_MAX)
+		return (EOVERFLOW);
+	*offset = (off_t)vi->size;
+	return (0);
+}
+
+/* Read symlink target string. */
+int
+erofs_readlink_target(struct vnode *vp, struct uio *uio)
+{
+	struct erofs_inode *vi;
+
+	vi = VTOE(vp);
+	if (vi->size == 0)
+		return (
+		    erofs_corrupt(MTOE(vp->v_mount), vi->nid, "empty symlink"));
+	return (erofs_read_uio(MTOE(vp->v_mount), vi, uio));
+}

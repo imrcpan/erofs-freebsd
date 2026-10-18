@@ -224,6 +224,8 @@ struct erofs_sb_info {
 	struct erofs_device_info *devs;
 };
 
+#define MTOE(mp) ((struct erofs_sb_info *)(mp)->mnt_data)
+
 #define EROFS_FEATURE_FUNCS(name, compat, feature)                           \
 	static inline bool erofs_sb_has_##name(                              \
 	    const struct erofs_sb_info *sbi)                                 \
@@ -260,6 +262,8 @@ struct erofs_inode {
 	uint8_t chunkbits;
 };
 
+#define VTOE(vp) ((struct erofs_inode *)(vp)->v_data)
+
 static inline unsigned int
 erofs_inode_version(unsigned int ifmt)
 {
@@ -281,7 +285,8 @@ erofs_nid_in_metabox(erofs_nid_t nid)
 /* Allocated on disk at m_pa. */
 #define EROFS_MAP_MAPPED 0x0001
 /* Located in metadata. */
-#define EROFS_MAP_META 0x0002
+#define EROFS_MAP_META	   0x0002
+#define EROFS_MAP_FRAGMENT 0x0010
 
 struct erofs_map_dev {
 	struct erofs_device_info *m_dif;
@@ -316,6 +321,9 @@ int erofs_read_data_readahead(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     erofs_off_t loff, size_t len, bool sequential, void **bufp);
 uint64_t erofs_dir_ra_bytes(struct erofs_sb_info *sbi);
 void erofs_record_dir_readahead(struct erofs_sb_info *sbi, unsigned int blocks);
+int erofs_read_file(struct vnode *vp, struct uio *uio);
+int erofs_file_llseek(struct vnode *vp, off_t *offset, bool seek_data);
+int erofs_readlink_target(struct vnode *vp, struct uio *uio);
 
 /* File-backed source I/O is owned by fileio.c. */
 int erofs_read_file_source(struct erofs_sb_info *sbi,
@@ -332,5 +340,7 @@ int z_erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct erofs_map_blocks *map);
 int z_erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     erofs_off_t loff, size_t len, void **bufp);
+int z_erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct uio *uio);
 
 #endif /* _FS_EROFS_INTERNAL_H_ */
