@@ -172,3 +172,225 @@ erofs_nid_is_valid(struct erofs_sb_info *sbi, erofs_nid_t nid)
 	return (off <= image_size &&
 	    sizeof(struct erofs_inode_compact) <= image_size - off);
 }
+
+int
+erofs_read_inode(struct erofs_sb_info *sbi, erofs_nid_t nid,
+    struct erofs_inode *vi)
+{
+	struct erofs_inode_compact *dic;
+	struct erofs_inode_extended *die;
+	struct erofs_inode_chunk_info chunk_info;
+	union erofs_inode_i_nb inode_nb;
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	uint64_t addrmask;
+	int64_t mtime;
+	erofs_off_t off;
+	erofs_blk_t startblk;
+	uint64_t compressed_blocks;
+	uint32_t raw_rdev, startblk_lo;
+	uint16_t ifmt, startblk_hi;
+	int err;
+
+	if (!erofs_nid_is_valid(sbi, nid))
+		return (erofs_corrupt(sbi, nid, "invalid nid"));
+	off = erofs_iloc(sbi, nid);
+	EROFS_TRACE_FILL_INODE(nid, off >> sbi->blkszbits,
+	    off & (sbi->block_size - 1));
+	err = erofs_read_metadata_range(sbi, nid, off,
+	    sizeof(struct erofs_inode_compact), &buf);
+	if (err != 0)
+		return (err);
+
+	bzero(&vi->size, sizeof(*vi) - offsetof(struct erofs_inode, size));
+	vi->nid = nid;
+	vi->inode_off = off;
+	ifmt = le16dec(buf.data);
+	if ((ifmt & ~EROFS_I_ALL) != 0) {
+		erofs_put_metabuf(&buf);
+		erofs_err(sbi, "unsupported inode format %#x @ nid %ju", ifmt,
+		    (uintmax_t)nid);
+		return (EOPNOTSUPP);
+	}
+	vi->datalayout = erofs_inode_datalayout(ifmt);
+	if (vi->datalayout >= EROFS_INODE_DATALAYOUT_MAX) {
+		erofs_put_metabuf(&buf);
+		erofs_err(sbi, "unsupported data layout %u @ nid %ju",
+		    vi->datalayout, (uintmax_t)nid);
+		return (EOPNOTSUPP);
+	}
+	vi->compact_inode = (erofs_inode_version(ifmt) == 0);
+	if (!vi->compact_inode) {
+		erofs_put_metabuf(&buf);
+		err = erofs_read_metadata_range(sbi, nid, off,
+		    sizeof(struct erofs_inode_extended), &buf);
+		if (err != 0)
+			return (err);
+	}
+	addrmask = erofs_addrmask(sbi);
+	startblk = EROFS_NULL_ADDR;
+	startblk_lo = 0;
+	startblk_hi = 0;
+	compressed_blocks = 0;
+	raw_rdev = 0;
+	bzero(&inode_nb, sizeof(inode_nb));
+	dic = buf.data;
+	if (vi->compact_inode) {
+		vi->inode_isize = sizeof(struct erofs_inode_compact);
+		vi->generation = erofs_inode_generation(sbi, nid, buf.data,
+		    vi->inode_isize);
+		vi->mode = le16toh(dic->i_mode);
+		vi->size = le32toh(dic->i_size);
+		vi->uid = le16toh(dic->i_uid);
+		vi->gid = le16toh(dic->i_gid);
+		vi->xattr_isize = erofs_xattr_ibody_size(dic->i_xattr_icount);
+		if (__builtin_add_overflow(sbi->epoch,
+			(int64_t)le32toh(dic->i_mtime), &mtime)) {
+			erofs_put_metabuf(&buf);
+			return (erofs_corrupt(sbi, nid,
+			    "mtime overflows the superblock epoch"));
+		}
+		err = erofs_set_timestamp(vi, mtime, sbi->fixed_nsec);
+		if (err != 0) {
+			erofs_put_metabuf(&buf);
+			return (erofs_corrupt(sbi, nid, "invalid mtime nsec %u",
+			    sbi->fixed_nsec));
+		}
+		startblk_lo = le32toh(dic->i_u.startblk_lo);
+		compressed_blocks = le32toh(dic->i_u.blocks_lo);
+		raw_rdev = le32toh(dic->i_u.rdev);
+		if (!S_ISDIR(vi->mode) &&
+		    ((ifmt >> EROFS_I_NLINK_1_BIT) & 0x1) != 0) {
+			vi->nlink = 1;
+			inode_nb = dic->i_nb;
+		} else {
+			vi->nlink = le16toh(dic->i_nb.nlink);
+			addrmask = UINT32_MAX;
+		}
+	} else {
+		die = buf.data;
+		vi->inode_isize = sizeof(struct erofs_inode_extended);
+		vi->generation = erofs_inode_generation(sbi, nid, buf.data,
+		    vi->inode_isize);
+		vi->mode = le16toh(die->i_mode);
+		vi->size = le64toh(die->i_size);
+		vi->uid = le32toh(die->i_uid);
+		vi->gid = le32toh(die->i_gid);
+		vi->nlink = le32toh(die->i_nlink);
+		inode_nb = die->i_nb;
+		vi->xattr_isize = erofs_xattr_ibody_size(die->i_xattr_icount);
+		err = erofs_set_timestamp(vi, (int64_t)le64toh(die->i_mtime),
+		    le32toh(die->i_mtime_nsec));
+		if (err != 0) {
+			erofs_put_metabuf(&buf);
+			return (erofs_corrupt(sbi, nid, "invalid mtime nsec %u",
+			    le32toh(die->i_mtime_nsec)));
+		}
+		startblk_lo = le32toh(die->i_u.startblk_lo);
+		compressed_blocks = le32toh(die->i_u.blocks_lo);
+		raw_rdev = le32toh(die->i_u.rdev);
+	}
+	startblk_hi = le16toh(inode_nb.startblk_hi);
+	compressed_blocks |= (uint64_t)le16toh(inode_nb.blocks_hi) << 32;
+	if (vi->size > (uint64_t)OFF_MAX) {
+		erofs_put_metabuf(&buf);
+		return (erofs_corrupt(sbi, nid, "size %ju is too large",
+		    (uintmax_t)vi->size));
+	}
+
+	vi->vtype = IFTOVT(vi->mode);
+	/* A mode with an unknown file type cannot be given a vnode type. */
+	if (vi->mode != 0 && vi->vtype == VNON) {
+		erofs_put_metabuf(&buf);
+		return (erofs_corrupt(sbi, nid, "invalid mode %#o", vi->mode));
+	}
+	if (vi->vtype == VLNK) {
+		if (vi->size == 0) {
+			erofs_put_metabuf(&buf);
+			return (erofs_corrupt(sbi, nid, "empty symlink"));
+		}
+	}
+	vi->dot_omitted = (vi->vtype == VDIR) &&
+	    (((ifmt >> EROFS_I_DOT_OMITTED_BIT) & 0x1) != 0);
+
+	if (erofs_inode_is_data_compressed(vi->datalayout)) {
+		err = z_erofs_fill_inode(sbi, vi);
+		if (err != 0) {
+			erofs_put_metabuf(&buf);
+			return (err);
+		}
+	} else if (vi->datalayout == EROFS_INODE_CHUNK_BASED) {
+		if (vi->compact_inode)
+			chunk_info = dic->i_u.c;
+		else
+			chunk_info = die->i_u.c;
+		if (le16toh(chunk_info.reserved) != 0) {
+			erofs_put_metabuf(&buf);
+			return (erofs_corrupt(sbi, nid,
+			    "reserved chunk field %#x is set",
+			    le16toh(chunk_info.reserved)));
+		}
+		vi->chunkformat = le16toh(chunk_info.format);
+		if (vi->chunkformat & ~EROFS_CHUNK_FORMAT_ALL) {
+			erofs_put_metabuf(&buf);
+			erofs_err(sbi, "unsupported chunk format %#x @ nid %ju",
+			    vi->chunkformat, (uintmax_t)nid);
+			return (EOPNOTSUPP);
+		}
+		if ((vi->chunkformat & EROFS_CHUNK_FORMAT_48BIT) != 0 &&
+		    (vi->chunkformat & EROFS_CHUNK_FORMAT_INDEXES) == 0) {
+			erofs_put_metabuf(&buf);
+			return (erofs_corrupt(sbi, nid,
+			    "chunk format %#x: 48-bit without chunk indexes",
+			    vi->chunkformat));
+		}
+		vi->chunkbits = sbi->blkszbits +
+		    (vi->chunkformat & EROFS_CHUNK_FORMAT_BLKBITS_MASK);
+	} else if (vi->datalayout != EROFS_INODE_FLAT_PLAIN &&
+	    vi->datalayout != EROFS_INODE_FLAT_INLINE) {
+		erofs_put_metabuf(&buf);
+		erofs_err(sbi, "unsupported data layout %u @ nid %ju",
+		    vi->datalayout, (uintmax_t)nid);
+		return (EOPNOTSUPP);
+	}
+
+	switch (vi->vtype) {
+	case VREG:
+	case VDIR:
+	case VLNK:
+		if (vi->datalayout == EROFS_INODE_CHUNK_BASED) {
+			vi->startblk = EROFS_NULL_ADDR;
+			vi->rdev = NODEV;
+			break;
+		}
+		startblk = startblk_lo | ((uint64_t)startblk_hi << 32);
+		if (vi->datalayout == EROFS_INODE_FLAT_PLAIN &&
+		    ((startblk ^ EROFS_NULL_ADDR) & addrmask) == 0)
+			startblk = EROFS_NULL_ADDR;
+		vi->startblk = startblk;
+		vi->rdev = NODEV;
+		break;
+	case VCHR:
+	case VBLK:
+		vi->startblk = EROFS_NULL_ADDR;
+		vi->rdev = erofs_decode_dev(raw_rdev);
+		break;
+	case VFIFO:
+	case VSOCK:
+		vi->startblk = EROFS_NULL_ADDR;
+		vi->rdev = NODEV;
+		break;
+	default:
+		erofs_put_metabuf(&buf);
+		return (erofs_corrupt(sbi, nid, "unknown file type, mode %#o",
+		    vi->mode));
+	}
+	erofs_set_data_blocks(sbi, vi, compressed_blocks);
+	err = erofs_validate_inline_data(sbi, vi);
+	if (err != 0) {
+		erofs_put_metabuf(&buf);
+		return (err);
+	}
+
+	erofs_put_metabuf(&buf);
+	return (0);
+}

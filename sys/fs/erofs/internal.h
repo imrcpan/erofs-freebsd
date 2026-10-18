@@ -109,6 +109,8 @@ void erofs_log_err(const struct erofs_sb_info *sbi, const char *func,
     const char *fmt, ...) __printflike(3, 4);
 int erofs_log_corrupt(const struct erofs_sb_info *sbi, uint64_t nid,
     const char *func, int line, const char *fmt, ...) __printflike(5, 6);
+#define erofs_err(sbi, fmt, ...) \
+	erofs_log_err((sbi), __func__, fmt, ##__VA_ARGS__)
 #define erofs_corrupt(sbi, nid, fmt, ...) \
 	erofs_log_corrupt((sbi), (nid), __func__, __LINE__, fmt, ##__VA_ARGS__)
 struct erofs_device_info;
@@ -197,6 +199,8 @@ struct erofs_sb_info {
 	uint32_t meta_blkaddr;
 	struct erofs_inode *metabox_en;
 	erofs_blk_t blocks;
+	int64_t epoch;
+	uint32_t fixed_nsec;
 	uint32_t generation_seed;
 	uint32_t feature_compat;
 	uint32_t feature_incompat;
@@ -220,13 +224,37 @@ struct erofs_inode {
 	uint64_t data_blocks;
 	/* Byte offset in the device, or in the metabox for a metabox nid. */
 	erofs_off_t inode_off;
+	erofs_blk_t startblk;
+	uint32_t generation;
+	uint32_t nlink;
+	uid_t uid;
+	gid_t gid;
+	mode_t mode;
 	__enum_uint8(vtype) vtype;
+	dev_t rdev;
 	time_t mtime;
 	uint32_t mtime_nsec;
 	uint8_t datalayout;
 	uint8_t inode_isize;
 	uint32_t xattr_isize;
+	bool compact_inode;
+	bool dot_omitted;
+	/* Chunk-based fields */
+	uint16_t chunkformat;
+	uint8_t chunkbits;
 };
+
+static inline unsigned int
+erofs_inode_version(unsigned int ifmt)
+{
+	return ((ifmt >> EROFS_I_VERSION_BIT) & EROFS_I_VERSION_MASK);
+}
+
+static inline unsigned int
+erofs_inode_datalayout(unsigned int ifmt)
+{
+	return ((ifmt >> EROFS_I_DATALAYOUT_BIT) & EROFS_I_DATALAYOUT_MASK);
+}
 
 static inline bool
 erofs_nid_in_metabox(erofs_nid_t nid)
@@ -238,6 +266,8 @@ struct erofs_buf {
 	void *data;
 	void (*release)(void *);
 };
+
+#define EROFS_BUF_INITIALIZER { .data = NULL, .release = NULL }
 
 /* Buffer and device I/O. */
 void erofs_put_metabuf(struct erofs_buf *buf);
@@ -256,5 +286,10 @@ int erofs_read_file_source(struct erofs_sb_info *sbi,
 
 /* Inode and vnode lifecycle. */
 bool erofs_nid_is_valid(struct erofs_sb_info *sbi, erofs_nid_t nid);
+int erofs_read_inode(struct erofs_sb_info *sbi, erofs_nid_t nid,
+    struct erofs_inode *vi);
+
+/* Compressed mapping and data. */
+int z_erofs_fill_inode(struct erofs_sb_info *sbi, struct erofs_inode *vi);
 
 #endif /* _FS_EROFS_INTERNAL_H_ */
