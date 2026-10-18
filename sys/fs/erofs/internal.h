@@ -312,6 +312,10 @@ int erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct erofs_map_blocks *map);
 int erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     erofs_off_t loff, size_t len, void **bufp);
+int erofs_read_data_readahead(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t loff, size_t len, bool sequential, void **bufp);
+uint64_t erofs_dir_ra_bytes(struct erofs_sb_info *sbi);
+void erofs_record_dir_readahead(struct erofs_sb_info *sbi, unsigned int blocks);
 
 /* File-backed source I/O is owned by fileio.c. */
 int erofs_read_file_source(struct erofs_sb_info *sbi,
@@ -326,5 +330,7 @@ int erofs_read_inode(struct erofs_sb_info *sbi, erofs_nid_t nid,
 int z_erofs_fill_inode(struct erofs_sb_info *sbi, struct erofs_inode *vi);
 int z_erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct erofs_map_blocks *map);
+int z_erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t loff, size_t len, void **bufp);
 
 #endif /* _FS_EROFS_INTERNAL_H_ */

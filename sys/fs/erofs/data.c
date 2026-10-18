@@ -581,3 +581,138 @@ erofs_read_physical_readahead(struct erofs_sb_info *sbi, unsigned int device_id,
 	free(rablkno, M_EROFS);
 	return (ret);
 }
+
+static int
+erofs_read_data_impl(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t loff, size_t len, unsigned int rablocks, void **bufp)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	struct erofs_map_blocks map;
+	char *out;
+	void *blk;
+	erofs_off_t mapoff, physical;
+	size_t done, want;
+	int error;
+
+	if (bufp == NULL)
+		return (EINVAL);
+	*bufp = NULL;
+	if (len == 0) {
+		return (0);
+	}
+	EROFS_TRACE_READ_FOLIO(vi, loff, len,
+	    !erofs_inode_is_data_compressed(vi->datalayout));
+	if (loff > vi->size || (uint64_t)len > vi->size - loff)
+		return (erofs_corrupt(sbi, vi->nid,
+		    "read of %zu bytes at %ju is beyond the size %ju", len,
+		    (uintmax_t)loff, (uintmax_t)vi->size));
+
+	/* Compressed file path */
+	if (erofs_inode_is_data_compressed(vi->datalayout))
+		return (z_erofs_read_data(sbi, vi, loff, len, bufp));
+
+	/* Uncompressed file path */
+	out = malloc(len, M_EROFS, M_WAITOK);
+	done = 0;
+	while (done < len) {
+		map = (struct erofs_map_blocks) { .m_la = loff + done };
+		error = erofs_map_blocks(sbi, vi, &map);
+		if (error != 0) {
+			free(out, M_EROFS);
+			return (error);
+		}
+		if (map.m_llen == 0 || map.m_la > loff + done ||
+		    loff + done - map.m_la >= map.m_llen) {
+			free(out, M_EROFS);
+			return (erofs_corrupt(sbi, vi->nid,
+			    "mapping of offset %ju is empty or does not cover "
+			    "it",
+			    (uintmax_t)(loff + done)));
+		}
+		mapoff = loff + done - map.m_la;
+		want = MIN((size_t)MIN(map.m_llen - mapoff, (uint64_t)MAXPHYS),
+		    len - done);
+		if ((map.m_flags & EROFS_MAP_MAPPED) == 0) {
+			bzero(out + done, want);
+		} else {
+			if ((map.m_flags & EROFS_MAP_META) != 0) {
+				if (mapoff > UINT64_MAX - map.m_pa) {
+					free(out, M_EROFS);
+					return (EOVERFLOW);
+				}
+				physical = map.m_pa + mapoff;
+				error = erofs_read_metadata_range(sbi, vi->nid,
+				    physical, want, &buf);
+			} else if (done == 0 && mapoff == 0 && rablocks != 0 &&
+			    map.m_flags == EROFS_MAP_MAPPED) {
+				error = erofs_read_physical_readahead(sbi,
+				    map.m_deviceid, map.m_pa, want, rablocks,
+				    &blk);
+			} else {
+				if (mapoff > UINT64_MAX - map.m_pa) {
+					free(out, M_EROFS);
+					return (EOVERFLOW);
+				}
+				physical = map.m_pa + mapoff;
+				error = erofs_read_physical(sbi, map.m_deviceid,
+				    physical, want, &blk);
+			}
+			if (error != 0) {
+				free(out, M_EROFS);
+				return (error);
+			}
+			if ((map.m_flags & EROFS_MAP_META) != 0) {
+				memcpy(out + done, buf.data, want);
+				erofs_put_metabuf(&buf);
+			} else {
+				memcpy(out + done, blk, want);
+				erofs_brelse(blk);
+			}
+		}
+		done += want;
+	}
+	*bufp = out;
+	return (0);
+}
+
+int
+erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t loff, size_t len, void **bufp)
+{
+	return (erofs_read_data_impl(sbi, vi, loff, len, 0, bufp));
+}
+
+int
+erofs_read_data_readahead(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t loff, size_t len, bool sequential, void **bufp)
+{
+	uint64_t dir_ra_bytes, total_blocks;
+	uint64_t remaining;
+	unsigned int rablocks;
+	int error;
+
+	rablocks = 0;
+	if (sequential && vi->datalayout == EROFS_INODE_FLAT_PLAIN &&
+	    sbi->block_size != 0 && (loff & (sbi->block_size - 1)) == 0 &&
+	    len <= sbi->block_size && loff <= vi->size &&
+	    len <= vi->size - loff) {
+		dir_ra_bytes = erofs_dir_ra_bytes(sbi);
+		total_blocks = dir_ra_bytes / sbi->block_size;
+		if (total_blocks > 1) {
+			remaining = vi->size - loff - len;
+			rablocks = MIN(total_blocks - 1,
+			    howmany(remaining, sbi->block_size));
+			rablocks = MIN(rablocks,
+			    (unsigned int)EROFS_DIR_READAHEAD_SLOTS);
+		}
+	}
+	EROFS_TRACE_READAHEAD(vi, loff >> PAGE_SHIFT,
+	    howmany((uint64_t)len +
+		    (uint64_t)rablocks * (uint64_t)sbi->block_size,
+		PAGE_SIZE),
+	    !erofs_inode_is_data_compressed(vi->datalayout));
+	error = erofs_read_data_impl(sbi, vi, loff, len, rablocks, bufp);
+	if (error == 0 && rablocks != 0)
+		erofs_record_dir_readahead(sbi, rablocks);
+	return (error);
+}
