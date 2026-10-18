@@ -205,6 +205,7 @@ struct erofs_sb_info {
 	struct erofs_device_info dif0;
 
 	uint32_t block_size;
+	uint32_t sb_size;
 	uint8_t blkszbits;
 	uint32_t meta_blkaddr;
 	struct erofs_inode *metabox_en;
@@ -238,6 +239,7 @@ struct erofs_sb_info {
 	}
 
 EROFS_FEATURE_FUNCS(lz4_0padding, incompat, INCOMPAT_LZ4_0PADDING)
+EROFS_FEATURE_FUNCS(compr_cfgs, incompat, INCOMPAT_COMPR_CFGS)
 EROFS_FEATURE_FUNCS(48bit, incompat, INCOMPAT_48BIT)
 EROFS_FEATURE_FUNCS(metabox, incompat, INCOMPAT_METABOX)
 
@@ -382,5 +384,9 @@ int z_erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 int z_erofs_decompress(struct erofs_sb_info *sbi,
     const struct erofs_map_blocks *map, const void *src, size_t srclen,
     void *dst, size_t dstlen, bool partial);
+
+/* Compression configuration. */
+int z_erofs_parse_cfgs(struct erofs_sb_info *sbi,
+    const struct erofs_super_block *dsb);
 
 #endif /* _FS_EROFS_INTERNAL_H_ */

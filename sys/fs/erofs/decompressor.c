@@ -85,6 +85,73 @@ static const struct z_erofs_decompressor *const z_erofs_decomp[] = {
 	[Z_EROFS_COMPRESSION_LZ4] = &z_erofs_lz4_decomp,
 };
 
+static int
+z_erofs_read_cfg(struct erofs_sb_info *sbi, uint64_t *offset,
+    struct erofs_buf *buf, size_t *sizep)
+{
+	struct erofs_buf metabuf = EROFS_BUF_INITIALIZER;
+	uint8_t length_buf[2];
+	uint64_t aligned;
+	uint16_t length;
+	int error;
+
+	/*
+	 * At most one configuration per algorithm, each at most 64 KiB, follows
+	 * the superblock, so the offset stays far below the overflow limit; the
+	 * reads are range checked.
+	 */
+	aligned = roundup2(*offset, 4);
+	error = erofs_read_metadata_range(sbi, 0, aligned, sizeof(length_buf),
+	    &metabuf);
+	if (error != 0)
+		return (error);
+	memcpy(length_buf, metabuf.data, sizeof(length_buf));
+	erofs_put_metabuf(&metabuf);
+	length = le16dec(length_buf);
+	*sizep = length != 0 ? length : UINT16_MAX + 1U;
+	*offset = aligned + sizeof(length_buf);
+	error = erofs_read_metadata_range(sbi, 0, *offset, *sizep, buf);
+	if (error == 0)
+		*offset += *sizep;
+	return (error);
+}
+
+int
+z_erofs_parse_cfgs(struct erofs_sb_info *sbi,
+    const struct erofs_super_block *dsb)
+{
+	struct erofs_buf data = EROFS_BUF_INITIALIZER;
+	const struct z_erofs_decompressor *decompressor;
+	uint64_t offset;
+	uint16_t algorithms;
+	size_t size;
+	int algorithm, ret;
+
+	if (!erofs_sb_has_compr_cfgs(sbi))
+		return (z_erofs_lz4_decomp.config(sbi, dsb, NULL, 0));
+	algorithms = le16toh(dsb->u1.available_compr_algs);
+	sbi->available_compr_algs = algorithms;
+	if ((algorithms & ~Z_EROFS_ALL_COMPR_ALGS) != 0)
+		return (EOPNOTSUPP);
+	offset = EROFS_SUPER_OFFSET + sbi->sb_size;
+	for (algorithm = 0; algorithm < Z_EROFS_COMPRESSION_MAX; ++algorithm) {
+		if ((algorithms & (1U << algorithm)) == 0)
+			continue;
+		ret = z_erofs_read_cfg(sbi, &offset, &data, &size);
+		if (ret != 0)
+			return (ret);
+		decompressor = z_erofs_decomp[algorithm];
+		if (decompressor == NULL || decompressor->config == NULL)
+			ret = EOPNOTSUPP;
+		else
+			ret = decompressor->config(sbi, dsb, data.data, size);
+		erofs_put_metabuf(&data);
+		if (ret != 0)
+			return (ret);
+	}
+	return (0);
+}
+
 int
 z_erofs_decompress(struct erofs_sb_info *sbi,
     const struct erofs_map_blocks *map, const void *src0, size_t srclen,
