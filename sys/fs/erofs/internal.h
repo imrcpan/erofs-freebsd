@@ -355,10 +355,12 @@ erofs_nid_to_ino64(const struct erofs_sb_info *sbi, erofs_nid_t nid)
 /* Allocated on disk at m_pa. */
 #define EROFS_MAP_MAPPED 0x0001
 /* Located in metadata. */
-#define EROFS_MAP_META		  0x0002
-#define EROFS_MAP_PARTIAL_MAPPED  0x0004
-#define EROFS_MAP_PARTIAL_REF	  0x0008
-#define EROFS_MAP_FRAGMENT	  0x0010
+#define EROFS_MAP_META		 0x0002
+#define EROFS_MAP_PARTIAL_MAPPED 0x0004
+#define EROFS_MAP_PARTIAL_REF	 0x0008
+#define EROFS_MAP_FRAGMENT	 0x0010
+#define EROFS_MAP_FULL(f) \
+	(!((f) & (EROFS_MAP_PARTIAL_MAPPED | EROFS_MAP_PARTIAL_REF)))
 
 #define EROFS_GET_BLOCKS_FIEMAP	  0x0001
 #define EROFS_GET_BLOCKS_FINDTAIL 0x0004

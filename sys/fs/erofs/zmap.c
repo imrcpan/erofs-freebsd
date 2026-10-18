@@ -842,3 +842,95 @@ z_erofs_fill_inode(struct erofs_sb_info *sbi, struct erofs_inode *vi)
 	vi->z_initialized = true;
 	return (0);
 }
+
+static int
+z_erofs_map_sanity_check(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct erofs_map_blocks *map)
+{
+	if ((map->m_flags & EROFS_MAP_FRAGMENT) != 0) {
+		/*
+		 * The fragment is read from the packed inode, and that read
+		 * checks the packed inode and the range (z_erofs_do_read(),
+		 * erofs_read_data()).
+		 */
+		KASSERT((map->m_flags & (EROFS_MAP_MAPPED | EROFS_MAP_META)) ==
+			0,
+		    ("erofs: fragment map with flags %#x",
+			(unsigned int)map->m_flags));
+		return (0);
+	}
+	if ((map->m_flags & EROFS_MAP_MAPPED) == 0)
+		return (0);
+	KASSERT(map->m_la < vi->size,
+	    ("erofs: extent at %ju, beyond the size %ju", (uintmax_t)map->m_la,
+		(uintmax_t)vi->size));
+	/*
+	 * On-disk algorithm IDs are validated where they are read, so only
+	 * the runtime formats can reach this point.
+	 */
+	KASSERT(map->m_algorithmformat < Z_EROFS_COMPRESSION_RUNTIME_MAX,
+	    ("erofs: unvalidated algorithm format %u", map->m_algorithmformat));
+	if (map->m_algorithmformat < Z_EROFS_COMPRESSION_MAX) {
+		if ((sbi->available_compr_algs &
+			(1U << map->m_algorithmformat)) == 0)
+			return (erofs_corrupt(sbi, vi->nid,
+			    "algorithm %u is not in the image's algorithm list",
+			    map->m_algorithmformat));
+		/*
+		 * A fully mapped compressed extent does not decode to fewer
+		 * bytes than it occupies, unless the end of the file cuts it
+		 * short.
+		 */
+		if (EROFS_MAP_FULL(map->m_flags) && map->m_llen < map->m_plen &&
+		    map->m_llen < vi->size - map->m_la)
+			return (erofs_corrupt(sbi, vi->nid,
+			    "extent at %ju decompresses to %ju bytes from %ju "
+			    "compressed",
+			    (uintmax_t)map->m_la, (uintmax_t)map->m_llen,
+			    (uintmax_t)map->m_plen));
+	} else if (map->m_llen > map->m_plen) {
+		/* Stored data is not longer than the pcluster holding it. */
+		return (erofs_corrupt(sbi, vi->nid,
+		    "uncompressed extent at %ju has length %ju > stored %ju",
+		    (uintmax_t)map->m_la, (uintmax_t)map->m_llen,
+		    (uintmax_t)map->m_plen));
+	}
+	if (map->m_plen > Z_EROFS_PCLUSTER_MAX_SIZE ||
+	    map->m_llen > Z_EROFS_PCLUSTER_MAX_DSIZE) {
+		erofs_err(sbi,
+		    "extent at %ju is too large (%ju bytes encoded, "
+		    "%ju decoded) @ nid %ju",
+		    (uintmax_t)map->m_la, (uintmax_t)map->m_plen,
+		    (uintmax_t)map->m_llen, (uintmax_t)vi->nid);
+		return (EOPNOTSUPP);
+	}
+	return (0);
+}
+
+int
+z_erofs_map_blocks(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct erofs_map_blocks *map)
+{
+	int err;
+
+	if (map->m_la >= vi->size) {
+		map->m_llen = map->m_la - vi->size + 1;
+		map->m_la = vi->size;
+		map->m_flags = 0;
+		return (0);
+	}
+	err = z_erofs_fill_inode(sbi, vi);
+	if (err == 0) {
+		if (vi->datalayout == EROFS_INODE_COMPRESSED_FULL &&
+		    (vi->z_advise & Z_EROFS_ADVISE_EXTENTS) != 0)
+			err = z_erofs_map_blocks_ext(sbi, vi, map);
+		else
+			err = z_erofs_map_blocks_fo(sbi, vi, map,
+			    EROFS_GET_BLOCKS_FIEMAP);
+	}
+	if (err == 0)
+		err = z_erofs_map_sanity_check(sbi, vi, map);
+	if (err != 0)
+		map->m_llen = 0;
+	return (err);
+}
