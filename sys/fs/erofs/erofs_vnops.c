@@ -41,6 +41,16 @@ static vop_setattr_t erofs_setattr;
 static vop_access_t erofs_access;
 static vop_pathconf_t erofs_pathconf;
 
+static vop_getextattr_t erofs_getextattr;
+static vop_listextattr_t erofs_listextattr;
+static vop_deleteextattr_t erofs_deleteextattr;
+static vop_setextattr_t erofs_setextattr;
+#ifdef UFS_ACL
+static vop_getacl_t erofs_vop_getacl;
+static vop_aclcheck_t erofs_aclcheck;
+static vop_setacl_t erofs_setacl;
+#endif
+
 /* vop_fhtovp removed in FreeBSD 15.0 */
 static vop_vptofh_t erofs_vptofh;
 
@@ -178,6 +188,80 @@ erofs_getattr(struct vop_getattr_args *ap)
 	vap->va_bytes = vi->data_blocks << sbi->blkszbits;
 	vap->va_filerev = 0;
 	return (0);
+}
+
+static int
+erofs_getextattr(struct vop_getextattr_args *ap __unused)
+{
+	int error;
+
+	if (VN_ISDEV(ap->a_vp))
+		return (EOPNOTSUPP);
+	if (ap->a_attrnamespace == EXTATTR_NAMESPACE_USER &&
+	    !test_opt(&MTOE(ap->a_vp->v_mount)->opt, XATTR_USER))
+		return (EOPNOTSUPP);
+	error = extattr_check_cred(ap->a_vp, ap->a_attrnamespace, ap->a_cred,
+	    ap->a_td, VREAD);
+	if (error != 0)
+		return (error);
+	if (ap->a_name == NULL || ap->a_name[0] == '\0')
+		return (EINVAL);
+	if (strlen(ap->a_name) > EXTATTR_MAXNAMELEN)
+		return (EINVAL);
+
+	switch (ap->a_attrnamespace) {
+	case EXTATTR_NAMESPACE_USER:
+	case EXTATTR_NAMESPACE_SYSTEM:
+		break;
+	default:
+		return (EOPNOTSUPP);
+	}
+
+	return (erofs_getxattr(ap->a_vp, ap->a_attrnamespace, ap->a_name,
+	    ap->a_uio, ap->a_size));
+}
+
+static int
+erofs_listextattr(struct vop_listextattr_args *ap __unused)
+{
+	int error;
+
+	if (VN_ISDEV(ap->a_vp))
+		return (EOPNOTSUPP);
+	if (ap->a_attrnamespace == EXTATTR_NAMESPACE_USER &&
+	    !test_opt(&MTOE(ap->a_vp->v_mount)->opt, XATTR_USER))
+		return (EOPNOTSUPP);
+	error = extattr_check_cred(ap->a_vp, ap->a_attrnamespace, ap->a_cred,
+	    ap->a_td, VREAD);
+	if (error != 0)
+		return (error);
+
+	switch (ap->a_attrnamespace) {
+	case EXTATTR_NAMESPACE_USER:
+	case EXTATTR_NAMESPACE_SYSTEM:
+		break;
+	default:
+		return (EOPNOTSUPP);
+	}
+
+	return (erofs_listxattr(ap->a_vp, ap->a_attrnamespace, ap->a_uio,
+	    ap->a_size));
+}
+
+static int
+erofs_deleteextattr(struct vop_deleteextattr_args *ap __unused)
+{
+	if (VN_ISDEV(ap->a_vp))
+		return (EOPNOTSUPP);
+	return (EROFS);
+}
+
+static int
+erofs_setextattr(struct vop_setextattr_args *ap __unused)
+{
+	if (VN_ISDEV(ap->a_vp))
+		return (EOPNOTSUPP);
+	return (EROFS);
 }
 
 /*
@@ -323,6 +407,48 @@ erofs_pathconf(struct vop_pathconf_args *ap)
 		return (vop_stdpathconf(ap));
 	}
 }
+
+#ifdef UFS_ACL
+static int
+erofs_vop_getacl(struct vop_getacl_args *ap)
+{
+	if (VN_ISDEV(ap->a_vp))
+		return (EOPNOTSUPP);
+	if ((ap->a_vp->v_mount->mnt_flag & MNT_ACLS) == 0)
+		return (EOPNOTSUPP);
+	return (erofs_get_acl(ap->a_vp, ap->a_type, ap->a_aclp));
+}
+
+static int
+erofs_aclcheck(struct vop_aclcheck_args *ap)
+{
+	if (VN_ISDEV(ap->a_vp))
+		return (EOPNOTSUPP);
+	if ((ap->a_vp->v_mount->mnt_flag & MNT_ACLS) == 0)
+		return (EOPNOTSUPP);
+	if (ap->a_aclp == NULL)
+		return (EINVAL);
+	switch (ap->a_type) {
+	case ACL_TYPE_ACCESS:
+		break;
+	case ACL_TYPE_DEFAULT:
+		if (ap->a_vp->v_type != VDIR)
+			return (EINVAL);
+		break;
+	default:
+		return (EINVAL);
+	}
+	return (acl_posix1e_check(ap->a_aclp));
+}
+
+static int
+erofs_setacl(struct vop_setacl_args *ap)
+{
+	if (VN_ISDEV(ap->a_vp))
+		return (EOPNOTSUPP);
+	return (EROFS);
+}
+#endif
 
 static u_int
 erofs_vfs_hash(erofs_nid_t nid)
@@ -488,6 +614,16 @@ struct vop_vector erofs_vnodeops = {
 	.vop_access = erofs_access,
 	.vop_pathconf = erofs_pathconf,
 
+	.vop_getextattr = erofs_getextattr,
+	.vop_listextattr = erofs_listextattr,
+	.vop_deleteextattr = erofs_deleteextattr,
+	.vop_setextattr = erofs_setextattr,
+#ifdef UFS_ACL
+	.vop_getacl = erofs_vop_getacl,
+	.vop_aclcheck = erofs_aclcheck,
+	.vop_setacl = erofs_setacl,
+#endif
+
 	.vop_vptofh = erofs_vptofh,
 };
 VFS_VOP_VECTOR_REGISTER(erofs_vnodeops);
@@ -495,10 +631,23 @@ VFS_VOP_VECTOR_REGISTER(erofs_vnodeops);
 struct vop_vector erofs_fifoops = {
 	.vop_default = &fifo_specops,
 	.vop_access = erofs_access,
+#ifdef UFS_ACL
+	.vop_aclcheck = erofs_aclcheck,
+#endif
+	.vop_deleteextattr = erofs_deleteextattr,
+#ifdef UFS_ACL
+	.vop_getacl = erofs_vop_getacl,
+#endif
+	.vop_getextattr = erofs_getextattr,
 	.vop_getattr = erofs_getattr,
+	.vop_listextattr = erofs_listextattr,
 	.vop_pathconf = erofs_pathconf,
 	.vop_reclaim = erofs_reclaim,
+#ifdef UFS_ACL
+	.vop_setacl = erofs_setacl,
+#endif
 	.vop_setattr = erofs_setattr,
+	.vop_setextattr = erofs_setextattr,
 	.vop_vptofh = erofs_vptofh,
 };
 VFS_VOP_VECTOR_REGISTER(erofs_fifoops);
