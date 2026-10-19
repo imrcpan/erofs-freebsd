@@ -113,6 +113,9 @@ int erofs_log_corrupt(const struct erofs_sb_info *sbi, uint64_t nid,
 	erofs_log_err((sbi), __func__, fmt, ##__VA_ARGS__)
 #define erofs_corrupt(sbi, nid, fmt, ...) \
 	erofs_log_corrupt((sbi), (nid), __func__, __LINE__, fmt, ##__VA_ARGS__)
+
+struct cdev;
+struct g_consumer;
 struct erofs_device_info;
 
 typedef uint64_t erofs_nid_t;
@@ -179,6 +182,8 @@ enum erofs_source_kind {
 
 struct erofs_device_info {
 	struct vnode *devvp;
+	struct cdev *dev;
+	struct g_consumer *cp;
 	struct erofs_device_handle *handle;
 	struct ucred *source_cred;
 	enum erofs_source_kind source_kind;

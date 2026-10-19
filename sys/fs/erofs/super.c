@@ -94,3 +94,93 @@ erofs_log_corrupt(const struct erofs_sb_info *sbi, uint64_t nid,
 	}
 	return (EINTEGRITY);
 }
+
+struct erofs_device_handle {
+	struct vnode *devvp;  /* block: private mntfs vnode; file: the file */
+	struct vnode *odevvp; /* block: the devfs vnode, reference only */
+	struct cdev *dev;
+	struct g_consumer *cp;
+	struct mount *source_mp;
+	struct mount_upper_node source_upper;
+	volatile u_int refs;
+};
+
+static void
+erofs_destroy_device_handle(struct erofs_device_handle *handle)
+{
+	if (handle == NULL)
+		return;
+	if (handle->source_mp != NULL) {
+		vfs_unregister_upper(handle->source_mp, &handle->source_upper);
+		handle->source_mp = NULL;
+	}
+	if (handle->odevvp != NULL) {
+		/*
+		 * Block device: close the consumer and free the private vnode
+		 * with the vnode locked, then drop the devfs vnode reference.
+		 */
+		if (handle->devvp != NULL) {
+			vn_lock(handle->devvp, LK_EXCLUSIVE | LK_RETRY);
+			if (handle->cp != NULL) {
+				g_topology_lock();
+				g_vfs_close(handle->cp);
+				g_topology_unlock();
+			}
+			mntfs_freevp(handle->devvp);
+		}
+		vrele(handle->odevvp);
+	} else if (handle->devvp != NULL) {
+		vrele(handle->devvp);
+	}
+	if (handle->dev != NULL)
+		dev_rel(handle->dev);
+	free(handle, M_EROFS);
+}
+
+static void
+erofs_release_device_info(struct erofs_device_info *dif)
+{
+	struct erofs_device_handle *handle;
+
+	handle = dif->handle;
+	dif->handle = NULL;
+	dif->cp = NULL;
+	dif->devvp = NULL;
+	dif->dev = NULL;
+	if (dif->source_cred != NULL) {
+		crfree(dif->source_cred);
+		dif->source_cred = NULL;
+	}
+	dif->source_kind = EROFS_SOURCE_NONE;
+	if (handle == NULL || !refcount_release(&handle->refs))
+		return;
+	erofs_destroy_device_handle(handle);
+}
+
+static struct erofs_device_handle *
+erofs_find_device_handle(struct erofs_sb_info *sbi, struct g_provider *pp)
+{
+	unsigned int i;
+
+	if (sbi == NULL)
+		return (NULL);
+	if (sbi->dif0.cp != NULL && sbi->dif0.cp->provider == pp)
+		return (sbi->dif0.handle);
+	for (i = 0; i < sbi->extra_devices; ++i) {
+		if (sbi->devs[i].cp != NULL && sbi->devs[i].cp->provider == pp)
+			return (sbi->devs[i].handle);
+	}
+	return (NULL);
+}
+
+static void
+erofs_free_dev_context(struct erofs_sb_info *sbi)
+{
+	unsigned int i;
+
+	if (sbi->devs != NULL) {
+		for (i = sbi->extra_devices; i > 0; --i)
+			erofs_release_device_info(&sbi->devs[i - 1]);
+		free(sbi->devs, M_EROFS);
+	}
+}
