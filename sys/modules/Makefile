@@ -545,6 +545,12 @@ SUBDIR+=	iscsi
 SUBDIR+=	fdt
 .endif
 
+# EROFS is 64-bit little-endian only.
+.if ${MACHINE_CPUARCH} == "aarch64" || ${MACHINE_CPUARCH} == "amd64" || \
+    ${MACHINE_CPUARCH} == "riscv"
+SUBDIR+=	erofs
+.endif
+
 # Linuxulator
 .if ${MACHINE_CPUARCH} == "aarch64" || ${MACHINE_CPUARCH} == "amd64" || \
     ${MACHINE_CPUARCH} == "i386"
