@@ -348,6 +348,7 @@ struct erofs_sb_info {
 	uint32_t sb_size;
 	uint8_t blkszbits;
 	uint32_t meta_blkaddr;
+	uint8_t xattr_filter_reserved;
 	erofs_nid_t packed_nid;
 	struct erofs_inode *metabox_en;
 	struct erofs_inode *packed_inode;
@@ -408,6 +409,14 @@ EROFS_FEATURE_FUNCS(fragments, incompat, INCOMPAT_FRAGMENTS)
 EROFS_FEATURE_FUNCS(dedupe, incompat, INCOMPAT_DEDUPE)
 EROFS_FEATURE_FUNCS(48bit, incompat, INCOMPAT_48BIT)
 EROFS_FEATURE_FUNCS(metabox, incompat, INCOMPAT_METABOX)
+EROFS_FEATURE_FUNCS(xattr_filter, compat, COMPAT_XATTR_FILTER)
+
+static inline bool
+erofs_sb_has_xattr_filter_v1(const struct erofs_sb_info *sbi)
+{
+	return (
+	    erofs_sb_has_xattr_filter(sbi) && sbi->xattr_filter_reserved == 0);
+}
 
 struct erofs_inode {
 	erofs_nid_t nid;

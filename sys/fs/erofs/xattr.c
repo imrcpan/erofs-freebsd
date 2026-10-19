@@ -24,6 +24,10 @@
 #define EROFS_XATTR_CACHE_BODY_LIMIT   (64UL * 1024)
 #define EROFS_XATTR_CACHE_MOUNT_BUDGET (1024UL * 1024)
 
+static int erofs_xattr_load_body(struct erofs_sb_info *sbi,
+    struct erofs_inode *vi, struct erofs_buf *bodybuf,
+    struct erofs_xattr_ibody_header **ihp, size_t *header_sizep);
+
 static uint32_t
 erofs_xxh32_rotl(uint32_t value, unsigned int count)
 {
@@ -158,6 +162,36 @@ erofs_xattr_read_backing(struct erofs_sb_info *sbi,
 	buf->data = data;
 	buf->release = erofs_brelse;
 	return (0);
+}
+
+static int
+erofs_xattr_filter_negative(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    int attrnamespace, const char *name, size_t name_len, bool *negativep)
+{
+	struct erofs_buf body = EROFS_BUF_INITIALIZER;
+	struct erofs_xattr_ibody_header *ih;
+	const char *filter_name;
+	size_t filter_name_len, header_size;
+	uint32_t hashbit, name_filter;
+	uint8_t index;
+	int error;
+
+	*negativep = false;
+	if (!erofs_sb_has_xattr_filter_v1(sbi) ||
+	    !erofs_xattr_filter_name(attrnamespace, name, name_len, &index,
+		&filter_name, &filter_name_len))
+		return (0);
+	error = erofs_xattr_load_body(sbi, vi, &body, &ih, &header_size);
+	if (error != 0)
+		return (error);
+	name_filter = le32toh(ih->h_name_filter);
+	hashbit = erofs_xxh32(filter_name, filter_name_len,
+	    EROFS_XATTR_FILTER_SEED + index);
+	hashbit &= EROFS_XATTR_FILTER_BITS - 1;
+	*negativep = (name_filter & (1U << hashbit)) != 0;
+	error = 0;
+	erofs_put_metabuf(&body);
+	return (error);
 }
 
 /*
@@ -320,4 +354,102 @@ erofs_xattr_cache_fini(struct erofs_sb_info *sbi, struct erofs_inode *vi)
 	free(data, M_EROFS);
 	cv_destroy(&cache->cv);
 	mtx_destroy(&cache->lock);
+}
+
+static int
+erofs_xattr_load_body(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    struct erofs_buf *bodybuf, struct erofs_xattr_ibody_header **ihp,
+    size_t *header_sizep)
+{
+	struct erofs_xattr_cache *cache;
+	bool reserved;
+	int error;
+
+	cache = &vi->xattr_cache;
+	if (!cache->initialized ||
+	    vi->xattr_isize > EROFS_XATTR_CACHE_BODY_LIMIT)
+		return (erofs_xattr_load_body_uncached(sbi, vi, bodybuf, ihp,
+		    header_sizep));
+	mtx_lock(&cache->lock);
+	if (cache->closing) {
+		mtx_unlock(&cache->lock);
+		return (ENXIO);
+	}
+	if (cache->state == EROFS_XATTR_CACHE_READY) {
+		KASSERT(cache->data != NULL,
+		    ("erofs xattr ready cache has no body"));
+		bodybuf->data = cache->data;
+		*ihp = bodybuf->data;
+		*header_sizep = sizeof(**ihp) +
+		    sizeof(uint32_t) * (*ihp)->h_shared_count;
+		mtx_unlock(&cache->lock);
+		return (0);
+	}
+	if (cache->state == EROFS_XATTR_CACHE_INFLIGHT) {
+		cache->waiters++;
+		do {
+			cv_wait(&cache->cv, &cache->lock);
+		} while (cache->state == EROFS_XATTR_CACHE_INFLIGHT);
+		if (cache->state == EROFS_XATTR_CACHE_READY) {
+			bodybuf->data = cache->data;
+			*ihp = bodybuf->data;
+			*header_sizep = sizeof(**ihp) +
+			    sizeof(uint32_t) * (*ihp)->h_shared_count;
+			error = 0;
+		} else {
+			KASSERT(cache->state == EROFS_XATTR_CACHE_FAILED &&
+				cache->error > 0,
+			    ("erofs xattr failed cache has no typed error"));
+			error = cache->error;
+		}
+		cache->waiters--;
+		if (cache->state == EROFS_XATTR_CACHE_FAILED &&
+		    cache->waiters == 0)
+			(void)erofs_xattr_cache_invalidate_locked(sbi, cache);
+		if (cache->waiters == 0)
+			cv_broadcast(&cache->cv);
+		mtx_unlock(&cache->lock);
+		return (error);
+	}
+	if (cache->state == EROFS_XATTR_CACHE_FAILED) {
+		if (cache->waiters != 0) {
+			mtx_unlock(&cache->lock);
+			return (erofs_xattr_load_body_uncached(sbi, vi, bodybuf,
+			    ihp, header_sizep));
+		}
+		(void)erofs_xattr_cache_invalidate_locked(sbi, cache);
+	}
+	reserved = erofs_xattr_cache_reserve(sbi, vi->xattr_isize);
+	if (!reserved) {
+		mtx_unlock(&cache->lock);
+		return (erofs_xattr_load_body_uncached(sbi, vi, bodybuf, ihp,
+		    header_sizep));
+	}
+	cache->state = EROFS_XATTR_CACHE_INFLIGHT;
+	cache->error = 0;
+	mtx_unlock(&cache->lock);
+
+	error = erofs_xattr_load_body_uncached(sbi, vi, bodybuf, ihp,
+	    header_sizep);
+	mtx_lock(&cache->lock);
+	if (error == 0 && !cache->closing) {
+		cache->data = bodybuf->data;
+		cache->charged_bytes = vi->xattr_isize;
+		cache->state = EROFS_XATTR_CACHE_READY;
+		bodybuf->release = NULL;
+		cv_broadcast(&cache->cv);
+		mtx_unlock(&cache->lock);
+		return (0);
+	}
+	if (error == 0)
+		error = ENXIO;
+	erofs_xattr_cache_release(sbi, vi->xattr_isize);
+	cache->error = error;
+	cache->state = EROFS_XATTR_CACHE_FAILED;
+	if (cache->waiters == 0)
+		(void)erofs_xattr_cache_invalidate_locked(sbi, cache);
+	cv_broadcast(&cache->cv);
+	mtx_unlock(&cache->lock);
+	erofs_put_metabuf(bodybuf);
+	return (error);
 }
