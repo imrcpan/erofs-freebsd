@@ -11,6 +11,9 @@
 #endif
 
 #include <fs/erofs/internal.h>
+
+int erofs_xattr_prefixes_init(struct erofs_sb_info *sbi);
+void erofs_xattr_prefixes_cleanup(struct erofs_sb_info *sbi);
 int erofs_listxattr(struct vnode *vp, int attrnamespace, struct uio *uio,
     size_t *sizep);
 int erofs_getxattr(struct vnode *vp, int attrnamespace, const char *name,

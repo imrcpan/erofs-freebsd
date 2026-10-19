@@ -878,3 +878,64 @@ erofs_xattr_load_body(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 	erofs_put_metabuf(bodybuf);
 	return (error);
 }
+
+void
+erofs_xattr_prefixes_cleanup(struct erofs_sb_info *sbi)
+{
+	if (sbi->xattr_prefixes == NULL)
+		return;
+	for (uint8_t i = 0; i < sbi->xattr_prefix_count; i++)
+		free(sbi->xattr_prefixes[i].infix, M_EROFS);
+	free(sbi->xattr_prefixes, M_EROFS);
+	sbi->xattr_prefixes = NULL;
+}
+
+int
+erofs_xattr_prefixes_init(struct erofs_sb_info *sbi)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	struct erofs_xattr_long_prefix *prefix = NULL;
+	struct erofs_inode *prefix_en;
+	erofs_off_t off;
+	size_t infix_len, len;
+	int ret;
+
+	if (!erofs_sb_has_xattr_prefixes(sbi) || sbi->xattr_prefix_count == 0)
+		return (0);
+	prefix_en = NULL;
+	if (!erofs_sb_has_plain_xattr_pfx(sbi)) {
+		if (erofs_sb_has_metabox(sbi)) {
+			if (sbi->metabox_en == NULL)
+				return (erofs_corrupt(sbi, EROFS_NID_NONE,
+				    "xattr prefixes are in the metabox, but "
+				    "the image has none"));
+			prefix_en = sbi->metabox_en;
+		} else if (sbi->packed_inode != NULL) {
+			prefix_en = sbi->packed_inode;
+		}
+	}
+	sbi->xattr_prefixes = malloc(sizeof(*sbi->xattr_prefixes) *
+		sbi->xattr_prefix_count,
+	    M_EROFS, M_WAITOK | M_ZERO);
+	off = (uint64_t)sbi->xattr_prefix_start << 2;
+	for (uint8_t i = 0; i < sbi->xattr_prefix_count; i++) {
+		ret = erofs_xattr_read_metadata(sbi, prefix_en, &off, &buf,
+		    &len);
+		if (ret != 0)
+			goto fail;
+		prefix = buf.data;
+		infix_len = len - sizeof(*prefix);
+		sbi->xattr_prefixes[i].base_index = prefix->base_index;
+		sbi->xattr_prefixes[i].infix_len = infix_len;
+		sbi->xattr_prefixes[i].infix = malloc(infix_len + 1, M_EROFS,
+		    M_WAITOK);
+		memcpy(sbi->xattr_prefixes[i].infix, prefix->infix, infix_len);
+		sbi->xattr_prefixes[i].infix[infix_len] = '\0';
+		erofs_put_metabuf(&buf);
+	}
+	return (0);
+fail:
+	erofs_put_metabuf(&buf);
+	erofs_xattr_prefixes_cleanup(sbi);
+	return (ret);
+}

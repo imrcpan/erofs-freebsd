@@ -355,6 +355,7 @@ struct erofs_sb_info {
 	uint8_t blkszbits;
 	uint32_t meta_blkaddr;
 	uint32_t xattr_blkaddr;
+	uint32_t xattr_prefix_start;
 	uint8_t xattr_prefix_count;
 	uint8_t xattr_filter_reserved;
 	erofs_nid_t packed_nid;
@@ -416,10 +417,12 @@ EROFS_FEATURE_FUNCS(big_pcluster, incompat, INCOMPAT_BIG_PCLUSTER)
 EROFS_FEATURE_FUNCS(chunked_file, incompat, INCOMPAT_CHUNKED_FILE)
 EROFS_FEATURE_FUNCS(fragments, incompat, INCOMPAT_FRAGMENTS)
 EROFS_FEATURE_FUNCS(dedupe, incompat, INCOMPAT_DEDUPE)
+EROFS_FEATURE_FUNCS(xattr_prefixes, incompat, INCOMPAT_XATTR_PREFIXES)
 EROFS_FEATURE_FUNCS(48bit, incompat, INCOMPAT_48BIT)
 EROFS_FEATURE_FUNCS(metabox, incompat, INCOMPAT_METABOX)
 EROFS_FEATURE_FUNCS(xattr_filter, compat, COMPAT_XATTR_FILTER)
 EROFS_FEATURE_FUNCS(shared_ea_in_metabox, compat, COMPAT_SHARED_EA_IN_METABOX)
+EROFS_FEATURE_FUNCS(plain_xattr_pfx, compat, COMPAT_PLAIN_XATTR_PFX)
 
 static inline bool
 erofs_sb_has_xattr_filter_v1(const struct erofs_sb_info *sbi)
