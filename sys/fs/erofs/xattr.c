@@ -21,6 +21,21 @@
 #include <machine/atomic.h>
 
 #include <fs/erofs/xattr.h>
+
+#ifdef UFS_ACL
+struct posix_acl_xattr_entry {
+	uint16_t e_tag;
+	uint16_t e_perm;
+	uint32_t e_id;
+};
+
+struct posix_acl_xattr_header {
+	uint32_t a_version;
+};
+
+#define POSIX_ACL_XATTR_VERSION	     0x0002
+#define EROFS_XATTR_FILTER_POSIX_ACL ((1U << 21) | (1U << 30))
+#endif
 #define EROFS_XATTR_CACHE_BODY_LIMIT   (64UL * 1024)
 #define EROFS_XATTR_CACHE_MOUNT_BUDGET (1024UL * 1024)
 
@@ -939,3 +954,183 @@ fail:
 	erofs_xattr_prefixes_cleanup(sbi);
 	return (ret);
 }
+
+#ifdef UFS_ACL
+static int
+erofs_inode_has_noacl(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    bool *noaclp)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	struct erofs_xattr_ibody_header *ih;
+	struct erofs_inode *backing_en;
+	erofs_off_t body_off;
+	uint32_t name_filter;
+	int error;
+
+	*noaclp = false;
+	if (vi->xattr_isize < sizeof(*ih)) {
+		*noaclp = true;
+		return (0);
+	}
+	if (!erofs_sb_has_xattr_filter(sbi) || sbi->xattr_filter_reserved != 0)
+		return (0);
+	body_off = vi->inode_off + vi->inode_isize;
+	backing_en = erofs_nid_in_metabox(vi->nid) ? sbi->metabox_en : NULL;
+	error = erofs_xattr_read_backing(sbi, backing_en, body_off, sizeof(*ih),
+	    &buf);
+	if (error != 0)
+		return (error);
+	ih = buf.data;
+	name_filter = le32toh(ih->h_name_filter);
+	erofs_put_metabuf(&buf);
+	*noaclp = (name_filter & EROFS_XATTR_FILTER_POSIX_ACL) ==
+	    EROFS_XATTR_FILTER_POSIX_ACL;
+	return (0);
+}
+
+static void
+erofs_acl_from_mode(mode_t mode, acl_type_t type, struct acl *aclp)
+{
+	if (type == ACL_TYPE_DEFAULT) {
+		aclp->acl_cnt = 0;
+		return;
+	}
+	aclp->acl_cnt = 3;
+	aclp->acl_entry[0].ae_tag = ACL_USER_OBJ;
+	aclp->acl_entry[0].ae_id = ACL_UNDEFINED_ID;
+	aclp->acl_entry[0].ae_perm = acl_posix1e_mode_to_perm(ACL_USER_OBJ,
+	    mode);
+	aclp->acl_entry[1].ae_tag = ACL_GROUP_OBJ;
+	aclp->acl_entry[1].ae_id = ACL_UNDEFINED_ID;
+	aclp->acl_entry[1].ae_perm = acl_posix1e_mode_to_perm(ACL_GROUP_OBJ,
+	    mode);
+	aclp->acl_entry[2].ae_tag = ACL_OTHER;
+	aclp->acl_entry[2].ae_id = ACL_UNDEFINED_ID;
+	aclp->acl_entry[2].ae_perm = acl_posix1e_mode_to_perm(ACL_OTHER, mode);
+}
+
+static int
+erofs_posix_acl_from_xattr(const void *value, size_t size, mode_t mode,
+    acl_type_t type, struct acl *aclp)
+{
+	const uint8_t *buf;
+	struct posix_acl_xattr_header hdr;
+	struct posix_acl_xattr_entry entry;
+	uint32_t id;
+	int count, i;
+
+	buf = value;
+	if (size < sizeof(hdr) || (size - sizeof(hdr)) % sizeof(entry) != 0)
+		return (EINTEGRITY);
+
+	memcpy(&hdr, buf, sizeof(hdr));
+	if (le32toh(hdr.a_version) != POSIX_ACL_XATTR_VERSION)
+		return (EINTEGRITY);
+
+	count = (size - sizeof(hdr)) / sizeof(entry);
+	if (count > ACL_MAX_ENTRIES)
+		return (EINTEGRITY);
+	if (count == 0) {
+		erofs_acl_from_mode(mode, type, aclp);
+		return (0);
+	}
+
+	aclp->acl_cnt = count;
+	for (i = 0; i < count; i++) {
+		memcpy(&entry, buf + sizeof(hdr) + i * sizeof(entry),
+		    sizeof(entry));
+		id = le32toh(entry.e_id);
+		aclp->acl_entry[i].ae_tag = le16toh(entry.e_tag);
+		aclp->acl_entry[i].ae_perm = le16toh(entry.e_perm);
+		aclp->acl_entry[i].ae_id = (id == UINT32_MAX) ?
+		    ACL_UNDEFINED_ID :
+		    id;
+	}
+	/*
+	 * Tags, their counts, permission bits and unnamed ids are the
+	 * kernel's ACL contract: acl_posix1e_check() enforces them.  Entry
+	 * order and duplicate ids are not checked: vaccess_acl_posix1e()
+	 * does not depend on either, and Linux accepts both.
+	 */
+	if (acl_posix1e_check(aclp) != 0)
+		return (EINTEGRITY);
+
+	return (0);
+}
+
+int
+erofs_get_acl(struct vnode *vp, acl_type_t type, struct acl *aclp)
+{
+	struct erofs_sb_info *sbi;
+	struct erofs_inode *vi;
+	const char *xattr_name;
+	struct uio auio;
+	struct iovec aiov;
+	uint8_t buf[sizeof(struct posix_acl_xattr_header) +
+	    sizeof(struct posix_acl_xattr_entry) * ACL_MAX_ENTRIES];
+	size_t size;
+	bool noacl;
+	int error;
+
+	sbi = MTOE(vp->v_mount);
+	if (!test_opt(&sbi->opt, POSIX_ACL))
+		return (EOPNOTSUPP);
+
+	vi = VTOE(vp);
+
+	switch (type) {
+	case ACL_TYPE_ACCESS:
+		xattr_name = "posix_acl_access";
+		break;
+	case ACL_TYPE_DEFAULT:
+		if (vp->v_type != VDIR)
+			return (EINVAL);
+		xattr_name = "posix_acl_default";
+		break;
+	default:
+		return (EINVAL);
+	}
+	error = erofs_inode_has_noacl(sbi, vi, &noacl);
+	if (error != 0)
+		return (error);
+	if (noacl) {
+		erofs_acl_from_mode(vi->mode, type, aclp);
+		return (0);
+	}
+
+	error = erofs_getxattr(vp, EXTATTR_NAMESPACE_SYSTEM, xattr_name, NULL,
+	    &size);
+	if (error == ENOATTR) {
+		erofs_acl_from_mode(vi->mode, type, aclp);
+		return (0);
+	}
+	if (error != 0)
+		return (error);
+	if (size > sizeof(buf))
+		return (erofs_corrupt(sbi, vi->nid,
+		    "ACL xattr of %zu bytes is too large", size));
+
+	aiov.iov_base = buf;
+	aiov.iov_len = size;
+	auio.uio_iov = &aiov;
+	auio.uio_iovcnt = 1;
+	auio.uio_offset = 0;
+	auio.uio_resid = size;
+	auio.uio_segflg = UIO_SYSSPACE;
+	auio.uio_rw = UIO_READ;
+	auio.uio_td = curthread;
+	error = erofs_getxattr(vp, EXTATTR_NAMESPACE_SYSTEM, xattr_name, &auio,
+	    NULL);
+	if (error != 0)
+		return (error);
+	if (auio.uio_resid != 0)
+		return (
+		    erofs_corrupt(sbi, vi->nid, "short read of the ACL xattr"));
+
+	error = erofs_posix_acl_from_xattr(buf, size, vi->mode, type, aclp);
+	if (error == EINTEGRITY)
+		return (erofs_corrupt(sbi, vi->nid,
+		    "invalid ACL xattr of %zu bytes", size));
+	return (error);
+}
+#endif
