@@ -40,6 +40,8 @@
 
 MALLOC_DEFINE(M_EROFS, "erofs", "EROFS filesystem");
 
+static const uint32_t erofs_crc32c_seed = 0x5045b54aU;
+
 /*
  * At most EROFS_ERR_MAXPPS lines a second for the whole module, so a bad
  * directory cannot flood the log.  The DTrace probe is not rate limited.
@@ -95,12 +97,70 @@ erofs_log_corrupt(const struct erofs_sb_info *sbi, uint64_t nid,
 	return (EINTEGRITY);
 }
 
+static int
+erofs_superblock_csum_verify(struct erofs_sb_info *sbi,
+    const struct erofs_super_block *dsb)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	uint32_t expected, crc;
+	size_t len;
+	int error;
+
+	if (!erofs_sb_has_sb_chksum(sbi))
+		return (0);
+
+	len = 1u << dsb->blkszbits;
+	if (len > EROFS_SUPER_OFFSET)
+		len -= EROFS_SUPER_OFFSET;
+
+	error = erofs_read_metadata_range(sbi, 0, EROFS_SUPER_OFFSET, len,
+	    &buf);
+	if (error != 0)
+		return (error);
+
+	crc = calculate_crc32c(erofs_crc32c_seed,
+	    (const uint8_t *)buf.data +
+		offsetof(struct erofs_super_block, checksum) +
+		sizeof(dsb->checksum),
+	    len - offsetof(struct erofs_super_block, checksum) -
+		sizeof(dsb->checksum));
+	expected = le32toh(dsb->checksum);
+	erofs_put_metabuf(&buf);
+
+	if (crc != expected) {
+		vfs_mount_error(sbi->mnt,
+		    "erofs: invalid superblock checksum 0x%08x, "
+		    "0x%08x expected",
+		    crc, expected);
+		return (EBADMSG);
+	}
+	return (0);
+}
+
 #define EROFS_DEVICE_OPT_PREFIX "device."
 
 struct erofs_device_arg {
 	uint16_t slot;
 	char *path;
 };
+
+static int
+erofs_load_generation_seed(struct erofs_sb_info *sbi, uint32_t sb_size,
+    uint32_t *seedp)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	uint32_t seed;
+	int error;
+
+	error = erofs_read_metadata_range(sbi, 0, EROFS_SUPER_OFFSET, sb_size,
+	    &buf);
+	if (error != 0)
+		return (error);
+	seed = fnv_32_buf(buf.data, sb_size, FNV1_32_INIT);
+	erofs_put_metabuf(&buf);
+	*seedp = seed != 0 ? seed : 1;
+	return (0);
+}
 
 static void
 erofs_free_device_args(struct erofs_device_arg *args, unsigned int count)
@@ -795,4 +855,146 @@ erofs_scan_devices(struct erofs_sb_info *sbi,
 out:
 	erofs_put_metabuf(&buf);
 	return (err);
+}
+
+static int
+erofs_init_packed_inode(struct erofs_sb_info *sbi)
+{
+	int error;
+
+	/* Load the packed carrier before any fragment-backed metabox inode. */
+	if (erofs_sb_has_fragments(sbi) && sbi->packed_nid > 0) {
+		sbi->packed_inode = malloc(sizeof(*sbi->packed_inode), M_EROFS,
+		    M_WAITOK | M_ZERO);
+		error = erofs_read_inode(sbi, sbi->packed_nid,
+		    sbi->packed_inode);
+		if (error != 0) {
+			free(sbi->packed_inode, M_EROFS);
+			sbi->packed_inode = NULL;
+			return (error);
+		}
+		/*
+		 * The type of the packed inode is not checked, and neither is
+		 * whether it has fragments of its own: every read of it is
+		 * bounded, and z_erofs_do_read() refuses a fragment that points
+		 * into the packed inode itself.
+		 */
+	}
+	return (0);
+}
+
+static int
+erofs_init_metabox_inode(struct erofs_sb_info *sbi)
+{
+	int error;
+
+	/*
+	 * METABOX NIDs address inode slots in this backing inode's data.  The
+	 * packed carrier is ready first so a compressed metabox may legally end
+	 * in a fragment pcluster without reading an uninitialized dependency.
+	 */
+	if (erofs_sb_has_metabox(sbi)) {
+		sbi->metabox_en = malloc(sizeof(*sbi->metabox_en), M_EROFS,
+		    M_WAITOK | M_ZERO);
+		error = erofs_read_inode(sbi, sbi->metabox_nid,
+		    sbi->metabox_en);
+		if (error != 0)
+			return (error);
+	}
+	return (0);
+}
+
+static int
+erofs_read_superblock(struct erofs_sb_info *sbi, struct erofs_super_block *dsb)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	uint32_t unsupported;
+	int ret;
+
+	ret = erofs_read_metadata_range(sbi, 0, EROFS_SUPER_OFFSET,
+	    sizeof(*dsb), &buf);
+	if (ret != 0)
+		return (ret);
+	memcpy(dsb, buf.data, sizeof(*dsb));
+	erofs_put_metabuf(&buf);
+
+	if (le32toh(dsb->magic) != EROFS_SUPER_MAGIC_V1)
+		return (EINVAL);
+	if (dsb->blkszbits < 9 || dsb->blkszbits > PAGE_SHIFT)
+		return (EINVAL);
+	sbi->blkszbits = dsb->blkszbits;
+	sbi->block_size = 1u << sbi->blkszbits;
+	if ((sbi->dif0.fsoff & (sbi->block_size - 1)) != 0) {
+		vfs_mount_error(sbi->mnt,
+		    "erofs: fsoffset %ju is not aligned to block size %u",
+		    (uintmax_t)sbi->dif0.fsoff, sbi->block_size);
+		return (EINVAL);
+	}
+	if (dsb->dirblkbits != 0) {
+		vfs_mount_error(sbi->mnt,
+		    "erofs: dirblkbits %u isn't supported", dsb->dirblkbits);
+		return (EINVAL);
+	}
+	sbi->feature_compat = le32toh(dsb->feature_compat);
+	ret = erofs_superblock_csum_verify(sbi, dsb);
+	if (ret != 0)
+		return (ret);
+
+	sbi->feature_incompat = le32toh(dsb->feature_incompat);
+	sbi->packed_nid = le64toh(dsb->packed_nid);
+	sbi->extra_devices = erofs_sb_has_device_table(sbi) ?
+	    le16toh(dsb->extra_devices) :
+	    0;
+	unsupported = sbi->feature_incompat & ~EROFS_ALL_FEATURE_INCOMPAT;
+	if (unsupported != 0) {
+		vfs_mount_error(sbi->mnt,
+		    "erofs: unidentified incompatible feature %x, please "
+		    "upgrade kernel",
+		    unsupported);
+		return (EINVAL);
+	}
+	sbi->sb_size = 128 + dsb->sb_extslots * EROFS_SB_EXTSLOT_SIZE;
+	if (sbi->sb_size > PAGE_SIZE - EROFS_SUPER_OFFSET)
+		return (EINVAL);
+	sbi->meta_blkaddr = le32toh(dsb->meta_blkaddr);
+	sbi->xattr_blkaddr = le32toh(dsb->xattr_blkaddr);
+	sbi->xattr_prefix_start = le32toh(dsb->xattr_prefix_start);
+	sbi->xattr_prefix_count = dsb->xattr_prefix_count;
+	sbi->xattr_filter_reserved = dsb->xattr_filter_reserved;
+	erofs_sb_blocks_root(dsb, sbi->feature_incompat, &sbi->blocks,
+	    &sbi->root_nid);
+	sbi->dif0.blocks = sbi->blocks;
+	if (sbi->dif0.blocks == 0) {
+		vfs_mount_error(sbi->mnt, "erofs: the image declares 0 blocks");
+		return (EINTEGRITY);
+	}
+	ret = erofs_validate_device_size(sbi, &sbi->dif0, sbi->dif0.blocks);
+	if (ret != 0)
+		return (ret);
+	sbi->inos = le64toh(dsb->inos);
+	sbi->epoch = (int64_t)le64toh(dsb->epoch);
+	/* Not checked here: erofs_set_timestamp() checks it for each inode. */
+	sbi->fixed_nsec = le32toh(dsb->fixed_nsec);
+	ret = erofs_load_generation_seed(sbi, sbi->sb_size,
+	    &sbi->generation_seed);
+	if (ret != 0)
+		return (ret);
+	if (erofs_sb_has_metabox(sbi)) {
+		if (sbi->sb_size <=
+		    offsetof(struct erofs_super_block, metabox_nid)) {
+			vfs_mount_error(sbi->mnt,
+			    "erofs: the superblock has no room for "
+			    "metabox_nid");
+			return (EINTEGRITY);
+		}
+		sbi->metabox_nid = le64toh(dsb->metabox_nid);
+		if (erofs_nid_in_metabox(sbi->metabox_nid)) {
+			vfs_mount_error(sbi->mnt,
+			    "erofs: metabox nid %ju is in the metabox",
+			    (uintmax_t)sbi->metabox_nid);
+			return (EINTEGRITY);
+		}
+	}
+
+	return (z_erofs_parse_cfgs(sbi, dsb));
 }
