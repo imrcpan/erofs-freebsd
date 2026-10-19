@@ -28,8 +28,13 @@
 static vop_inactive_t erofs_inactive;
 static vop_reclaim_t erofs_reclaim;
 
+static vop_readdir_t erofs_readdir;
+static vop_readlink_t erofs_readlink;
+
 static vop_open_t erofs_open;
+static vop_read_t erofs_read;
 static vop_bmap_t erofs_bmap;
+static vop_ioctl_t erofs_ioctl;
 
 static vop_getattr_t erofs_getattr;
 static vop_setattr_t erofs_setattr;
@@ -210,6 +215,63 @@ erofs_setattr(struct vop_setattr_args *ap)
 		}
 	}
 	return (0);
+}
+
+static int
+erofs_read(struct vop_read_args *ap)
+{
+	switch (ap->a_vp->v_type) {
+	case VREG:
+		return (erofs_read_file(ap->a_vp, ap->a_uio));
+	case VDIR:
+		return (EISDIR);
+	default:
+		return (EINVAL);
+	}
+}
+
+static int
+erofs_ioctl(struct vop_ioctl_args *ap)
+{
+	struct vnode *vp;
+	bool seek_data;
+	int error;
+
+	switch (ap->a_command) {
+	case FIOSEEKDATA:
+		seek_data = true;
+		break;
+	case FIOSEEKHOLE:
+		seek_data = false;
+		break;
+	default:
+		return (ENOTTY);
+	}
+
+	vp = ap->a_vp;
+	error = vn_lock(vp, LK_SHARED);
+	if (error != 0)
+		return (EBADF);
+	error = erofs_file_llseek(vp, (off_t *)ap->a_data, seek_data);
+	VOP_UNLOCK(vp);
+	return (error);
+}
+
+static int
+erofs_readdir(struct vop_readdir_args *ap)
+{
+	if (ap->a_vp->v_type != VDIR)
+		return (ENOTDIR);
+	return (erofs_readdir_block(ap->a_vp, ap->a_uio, ap->a_eofflag,
+	    ap->a_ncookies, ap->a_cookies));
+}
+
+static int
+erofs_readlink(struct vop_readlink_args *ap)
+{
+	if (ap->a_vp->v_type != VLNK)
+		return (EINVAL);
+	return (erofs_readlink_target(ap->a_vp, ap->a_uio));
 }
 
 static int
@@ -412,9 +474,14 @@ struct vop_vector erofs_vnodeops = {
 
 	.vop_lookup = vfs_cache_lookup,
 	.vop_cachedlookup = erofs_lookup,
+	.vop_readdir = erofs_readdir,
+	.vop_readlink = erofs_readlink,
 
 	.vop_open = erofs_open,
+	.vop_read = erofs_read,
 	.vop_bmap = erofs_bmap,
+	.vop_ioctl = erofs_ioctl,
+	.vop_getpages = vnode_pager_local_getpages,
 
 	.vop_getattr = erofs_getattr,
 	.vop_setattr = erofs_setattr,
