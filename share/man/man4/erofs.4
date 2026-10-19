@@ -1,0 +1,228 @@
+.\"-
+.\" SPDX-License-Identifier: BSD-2-Clause
+.\"
+.\" Copyright (c) 2026
+.\" All rights reserved.
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.Dd October 19, 2026
+.Dt EROFS 4
+.Os
+.Sh NAME
+.Nm erofs
+.Nd Enhanced Read-Only File System
+.Sh SYNOPSIS
+To compile this driver into the kernel, place the following line in
+your kernel configuration file:
+.Bd -ragged -offset indent
+.Cd "options EROFS"
+.Ed
+.Pp
+Alternatively, to load the driver as a module at boot time, place the
+following line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+erofs_load="YES"
+.Ed
+.Sh DESCRIPTION
+The
+.Nm
+driver provides read-only access to file systems in the Enhanced Read-Only
+File System (EROFS) format.
+EROFS was designed for Linux and is used for system images, firmware and
+container layers.
+Images are normally created with
+.Sy mkfs.erofs
+from the erofs-utils package.
+.Pp
+The image can be on a disk provider or in a regular file.
+A regular file can be mounted directly or through
+.Xr mdconfig 8 .
+The driver always mounts the file system read-only; an explicit
+.Fl o Cm rw
+still results in a read-only mount.
+Operations that would modify the file system fail with
+.Er EROFS .
+.Pp
+The driver understands compact and extended inodes, plain, inline
+(tail-packed) and chunk-based data, compressed data, shared, inline and
+long-prefix extended attributes, fragments, the metabox, 48-bit block counts,
+and the device table of multi-device images.
+Compressed data can use LZ4, DEFLATE, zstd or LZMA (MicroLZMA).
+DEFLATE images are decoded with the kernel zlib module, which is loaded as a
+dependency.
+zstd images need a kernel with
+.Cd "options ZSTDIO" ;
+without it they are rejected when mounted.
+Unsupported features of an image, such as an unknown data layout or
+compression algorithm, are reported with
+.Er EOPNOTSUPP .
+.Pp
+Extended attributes in the user namespace are shown without a prefix.
+Extended attributes in the system namespace keep their full names
+.Pq Li trusted.* , security.* .
+Linux POSIX access and default ACLs are converted to
+.Fx
+POSIX.1e ACLs.
+This needs a kernel with
+.Cd "options UFS_ACL" ;
+without it, ACLs are not available, permissions are checked against the
+mode bits only, and the
+.Cm acl
+and
+.Cm noacl
+mount options are rejected with
+.Er EOPNOTSUPP .
+The file system can be exported over NFS.
+.Pp
+There is no file system specific mount utility.
+Use
+.Xr mount 8
+with
+.Fl t Cm erofs ,
+which passes the options below to
+.Xr nmount 2 .
+.Sh MOUNT OPTIONS
+.Bl -tag -width indent
+.It Cm acl
+Enable POSIX ACLs.
+This is the default when the kernel has
+.Cd "options UFS_ACL" .
+.It Cm noacl
+Do not use POSIX ACLs; check permissions against the mode bits only.
+.It Cm user_xattr
+Make the extended attributes of the user namespace available.
+This is the default.
+.It Cm nouser_xattr
+Hide the extended attributes of the user namespace.
+Attributes of the other namespaces and POSIX ACLs are not affected.
+.It Cm directio
+When the image is a regular file, read it with
+.Dv IO_DIRECT ,
+which asks the file system holding the image to bypass its buffer cache.
+That file system may refuse the request or ignore it.
+.It Cm nodirectio
+Read the image through the page cache of the file holding it.
+This is the default.
+.It Cm fsoffset Ns = Ns Ar bytes
+The file system starts
+.Ar bytes
+bytes into the device or file.
+The offset must be a multiple of the block size of the image.
+The default is 0.
+.It Cm device Ns = Ns Ar path
+Use the disk provider or file at
+.Ar path
+as the single external device of the image.
+.It Cm device\&. Ns Ar N Ns = Ns Ar path
+Use the disk provider or file at
+.Ar path
+as the external device in slot
+.Ar N
+(counting from 1) of the image.
+.Xr mount 8
+keeps only one of several options with the same name, so an image with more
+than one external device needs the numbered form.
+The two forms cannot be mixed.
+Several slots may refer to the same path, including the path of the primary
+device.
+If the image has a device table and no external devices are given, the
+additional devices are read from the primary device at the addresses recorded
+in the table.
+.It Cm dir_ra_bytes Ns = Ns Ar bytes
+How much of a directory is read ahead when it is scanned.
+The value must be 0, which turns readahead off, or a multiple of the block size
+of the image, and at most the smaller of 1 MiB and 256 blocks.
+The default is 16384.
+.It Cm cache_strategy Ns = Ns Ar strategy
+Decoded extents of compressed files are kept in a small cache.
+With
+.Cm disabled
+the cache is not used.
+.Cm readahead
+and
+.Cm readaround
+are accepted for compatibility with Linux and currently behave in the same
+way.
+The default is
+.Cm readaround .
+.It Cm sync_decompress Ns = Ns Ar mode
+Where compressed data is decoded.
+With
+.Cm auto
+or
+.Cm on
+the thread that reads the data decodes it.
+With
+.Cm off
+the work is handed to a pool of kernel threads, named
+.Dq erofs decode ,
+and the reading thread waits for the result.
+.Cm 0 ,
+.Cm 1
+and
+.Cm 2
+are accepted for
+.Cm auto ,
+.Cm on
+and
+.Cm off .
+The default is
+.Cm auto .
+.It Cm worker_queue_priority Ns = Ns Ar priority
+The priority, from 0 to 255, of decoding tasks in the queue of the decode
+threads.
+Tasks with a larger value are run first; tasks with the same value are run in
+the order they were queued.
+The default is 0.
+.It Cm async , noatime , noclusterr , noclusterw , nosymfollow , sync , union
+Accepted so that a mount command written for another file system works.
+They are handled by the VFS layer.
+Only
+.Cm nosymfollow
+and
+.Cm union
+have an effect on a read-only file system.
+.El
+.Pp
+These options can be changed with
+.Cm mount -u :
+.Cm acl ,
+.Cm noacl ,
+.Cm user_xattr ,
+.Cm nouser_xattr ,
+.Cm directio ,
+.Cm nodirectio ,
+.Cm dir_ra_bytes ,
+.Cm cache_strategy ,
+.Cm sync_decompress
+and
+.Cm worker_queue_priority .
+.Cm fsoffset
+can be given again only with its current value.
+.Cm device
+and
+.Cm device\&. Ns Ar N
+are rejected with
+.Er EOPNOTSUPP
+because the devices of a mounted file system cannot change.

@@ -164,6 +164,7 @@ MAN=	aac.4 \
 	enc.4 \
 	enic.4 \
 	epair.4 \
+	erofs.4 \
 	est.4 \
 	et.4 \
 	etherswitch.4 \
