@@ -138,3 +138,102 @@ erofs_parse_dir_ra_option(struct erofs_sb_info *sbi, struct vfsoptlist *opts)
 		return (error);
 	return (erofs_set_dir_ra_bytes(sbi, value));
 }
+
+static int
+erofs_validate_zip_value(const char *value, int len)
+{
+	if (value == NULL || len <= 1 || value[len - 1] != '\0' ||
+	    strnlen(value, (size_t)len) != (size_t)len - 1)
+		return (EINVAL);
+	return (0);
+}
+
+static int
+erofs_parse_zip_uint(const char *value, int len, unsigned int *result)
+{
+	size_t i;
+	unsigned int parsed;
+
+	if (erofs_validate_zip_value(value, len) != 0)
+		return (EINVAL);
+	parsed = 0;
+	for (i = 0; i < (size_t)len - 1; ++i) {
+		if (value[i] < '0' || value[i] > '9' ||
+		    parsed > (UINT_MAX - (value[i] - '0')) / 10)
+			return (EINVAL);
+		parsed = parsed * 10 + (value[i] - '0');
+	}
+	*result = parsed;
+	return (0);
+}
+
+int
+erofs_parse_zip_options(struct mount *mp, struct erofs_sb_info_opts *opts,
+    unsigned int *syncp, bool *cache_presentp, bool *sync_presentp)
+{
+	struct vfsopt *opt;
+	unsigned int value;
+	bool queue_priority_present;
+	int error;
+
+	*cache_presentp = false;
+	*sync_presentp = false;
+	queue_priority_present = false;
+	TAILQ_FOREACH(opt, mp->mnt_optnew, link) {
+		if (strcmp(opt->name, "cache_strategy") == 0) {
+			if (opt->value == NULL || opt->len <= 1 ||
+			    ((char *)opt->value)[opt->len - 1] != '\0' ||
+			    strnlen(opt->value, opt->len) !=
+				(size_t)opt->len - 1)
+				return (EINVAL);
+			if (strcmp(opt->value, "disabled") == 0)
+				opts->cache_strategy = EROFS_ZIP_CACHE_DISABLED;
+			else if (strcmp(opt->value, "readahead") == 0)
+				opts->cache_strategy =
+				    EROFS_ZIP_CACHE_READAHEAD;
+			else if (strcmp(opt->value, "readaround") == 0)
+				opts->cache_strategy =
+				    EROFS_ZIP_CACHE_READAROUND;
+			else
+				return (EINVAL);
+			*cache_presentp = true;
+			continue;
+		}
+		if (strcmp(opt->name, "worker_queue_priority") == 0) {
+			error = erofs_parse_zip_uint(opt->value, opt->len,
+			    &value);
+			if (error != 0 || value > UINT8_MAX)
+				return (EINVAL);
+			opts->worker_queue_priority = (uint8_t)value;
+			queue_priority_present = true;
+			continue;
+		}
+		if (strcmp(opt->name, "sync_decompress") != 0)
+			continue;
+		error = erofs_validate_zip_value(opt->value, opt->len);
+		if (error != 0)
+			return (error);
+		if (strcmp(opt->value, "auto") == 0)
+			value = EROFS_SYNC_DECOMPRESS_AUTO;
+		else if (strcmp(opt->value, "on") == 0)
+			value = EROFS_SYNC_DECOMPRESS_FORCE_ON;
+		else if (strcmp(opt->value, "off") == 0)
+			value = EROFS_SYNC_DECOMPRESS_FORCE_OFF;
+		else {
+			error = erofs_parse_zip_uint(opt->value, opt->len,
+			    &value);
+			if (error != 0 ||
+			    value > EROFS_SYNC_DECOMPRESS_FORCE_OFF)
+				return (EINVAL);
+		}
+		*syncp = value;
+		*sync_presentp = true;
+	}
+	if (*cache_presentp)
+		vfs_deleteopt(mp->mnt_optnew, "cache_strategy");
+	if (*sync_presentp)
+		vfs_deleteopt(mp->mnt_optnew, "sync_decompress");
+	if (queue_priority_present)
+		vfs_deleteopt(mp->mnt_optnew, "worker_queue_priority");
+	return (0);
+}

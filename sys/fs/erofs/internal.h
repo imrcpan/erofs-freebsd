@@ -154,6 +154,7 @@ _Static_assert(PAGE_SHIFT <= 16, "EROFS block sizes are at most 64 KiB");
 struct erofs_sb_info_opts {
 	unsigned int mount_opt;
 	uint8_t cache_strategy;
+	uint8_t worker_queue_priority;
 };
 
 enum erofs_sync_decompress {
@@ -655,6 +656,9 @@ int z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
 /* Compression configuration. */
 int z_erofs_parse_cfgs(struct erofs_sb_info *sbi,
     const struct erofs_super_block *dsb);
+
+int erofs_parse_zip_options(struct mount *mp, struct erofs_sb_info_opts *opts,
+    unsigned int *syncp, bool *cache_presentp, bool *sync_presentp);
 
 int erofs_parse_dir_ra_option(struct erofs_sb_info *sbi,
     struct vfsoptlist *opts);
