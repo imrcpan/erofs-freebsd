@@ -350,6 +350,8 @@ struct erofs_sb_info {
 	struct mount *mnt;
 	struct erofs_device_info dif0;
 	struct mtx control_lock;
+	struct sysctl_ctx_list sysctl_ctx;
+	uint64_t control_id;
 	uint64_t dir_ra_bytes;
 	uint64_t dir_ra_max_bytes;
 	uint64_t dir_ra_requests;
@@ -666,6 +668,8 @@ int erofs_parse_dir_ra_value(struct erofs_sb_info *sbi, struct vfsoptlist *opts,
     uint64_t *valuep, bool *presentp);
 void erofs_management_init(struct erofs_sb_info *sbi);
 void erofs_management_fini(struct erofs_sb_info *sbi);
+int erofs_register_sysfs(struct erofs_sb_info *sbi);
+int erofs_unregister_sysfs(struct erofs_sb_info *sbi);
 
 /* VOP vectors. */
 extern struct vop_vector erofs_vnodeops;

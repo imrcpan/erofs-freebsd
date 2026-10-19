@@ -27,6 +27,17 @@ enum erofs_cache_metric {
 	EROFS_CACHE_BYTES,
 };
 
+static struct mtx erofs_control_id_lock;
+static uint64_t erofs_control_next_id = 1;
+
+MTX_SYSINIT(erofs_control_id, &erofs_control_id_lock, "erofs control id",
+    MTX_DEF);
+
+SYSCTL_NODE(_vfs, OID_AUTO, erofs, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "EROFS filesystem");
+SYSCTL_NODE(_vfs_erofs, OID_AUTO, mounts, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "Mounted EROFS filesystems");
+
 void
 erofs_management_init(struct erofs_sb_info *sbi)
 {
@@ -396,5 +407,160 @@ erofs_sysctl_worker_queue_priority(SYSCTL_HANDLER_ARGS)
 	sbi->decompress_queue_priority = (uint8_t)value;
 	sbi->opt.worker_queue_priority = (uint8_t)value;
 	mtx_unlock(&sbi->control_lock);
+	return (0);
+}
+
+int
+erofs_register_sysfs(struct erofs_sb_info *sbi)
+{
+	struct sysctl_oid *cache_node, *mount_node;
+	char name[24];
+	int error;
+
+	mtx_lock(&erofs_control_id_lock);
+	sbi->control_id = erofs_control_next_id++;
+	mtx_unlock(&erofs_control_id_lock);
+
+	sbi->dir_ra_max_bytes = erofs_dir_ra_limit(sbi);
+
+	snprintf(name, sizeof(name), "%ju", (uintmax_t)sbi->control_id);
+	sysctl_ctx_init(&sbi->sysctl_ctx);
+	sbi->sysctl_registered = true;
+	mount_node = SYSCTL_ADD_NODE(&sbi->sysctl_ctx,
+	    SYSCTL_STATIC_CHILDREN(_vfs_erofs_mounts), OID_AUTO, name,
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "EROFS mount");
+	if (mount_node == NULL)
+		goto fail;
+	if (SYSCTL_ADD_U64(&sbi->sysctl_ctx, SYSCTL_CHILDREN(mount_node),
+		OID_AUTO, "mount_id", CTLFLAG_RD, &sbi->control_id, 0,
+		"Unique mount control identifier") == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(mount_node),
+		OID_AUTO, "dir_ra_bytes",
+		CTLTYPE_U64 | CTLFLAG_RW | CTLFLAG_MPSAFE, sbi, 0,
+		erofs_sysctl_dir_ra, "QU",
+		"Directory readahead window in bytes") == NULL ||
+	    SYSCTL_ADD_U64(&sbi->sysctl_ctx, SYSCTL_CHILDREN(mount_node),
+		OID_AUTO, "dir_ra_max_bytes", CTLFLAG_RD,
+		&sbi->dir_ra_max_bytes, 0,
+		"Maximum directory readahead window") == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(mount_node),
+		OID_AUTO, "dir_ra_requests",
+		CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sbi, 0,
+		erofs_sysctl_dir_ra_metric, "QU",
+		"Directory readahead submissions") == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(mount_node),
+		OID_AUTO, "dir_ra_blocks",
+		CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sbi, 1,
+		erofs_sysctl_dir_ra_metric, "QU",
+		"Directory readahead blocks submitted") == NULL)
+		goto fail;
+	if (SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(mount_node),
+		OID_AUTO, "drop_caches",
+		CTLTYPE_U64 | CTLFLAG_WR | CTLFLAG_MPSAFE, sbi, 0,
+		erofs_sysctl_drop_caches, "QU",
+		"Write 1 to drop the FreeBSD decoded extent cache") == NULL)
+		goto fail;
+	if (SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(mount_node),
+		OID_AUTO, "sync_decompress",
+		CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sbi, 0,
+		erofs_sysctl_zip_setting, "I",
+		"0=auto, 1=on, 2=off; off decodes in the worker threads") ==
+		NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(mount_node),
+		OID_AUTO, "cache_strategy",
+		CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sbi, 1,
+		erofs_sysctl_zip_setting, "I",
+		"0=disabled, 1=readahead, 2=readaround") == NULL)
+		goto fail;
+	cache_node = SYSCTL_ADD_NODE(&sbi->sysctl_ctx,
+	    SYSCTL_CHILDREN(mount_node), OID_AUTO, "decoded_cache",
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+	    "FreeBSD decoded extent cache, not Linux managed pclusters");
+	if (cache_node == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "hits", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		sbi, EROFS_CACHE_HITS, erofs_sysctl_cache_metric, "QU",
+		"Cache hits") == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "misses", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		sbi, EROFS_CACHE_MISSES, erofs_sysctl_cache_metric, "QU",
+		"Cache misses") == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "bypasses", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		sbi, EROFS_CACHE_BYPASSES, erofs_sysctl_cache_metric, "QU",
+		"Cache admission bypasses") == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "evictions",
+		CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sbi,
+		EROFS_CACHE_EVICTIONS, erofs_sysctl_cache_metric, "QU",
+		"Cache evictions") == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "reclaims", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		sbi, EROFS_CACHE_RECLAIMS, erofs_sysctl_cache_metric, "QU",
+		"Cache pressure reclaims") == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "waiter_merges",
+		CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, sbi,
+		EROFS_CACHE_WAITER_MERGES, erofs_sysctl_cache_metric, "QU",
+		"Inflight cache waiter merges") == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "entries", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		sbi, EROFS_CACHE_ENTRIES, erofs_sysctl_cache_metric, "QU",
+		"Resident decoded extents") == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "bytes", CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE,
+		sbi, EROFS_CACHE_BYTES, erofs_sysctl_cache_metric, "QU",
+		"Resident decoded bytes") == NULL ||
+	    SYSCTL_ADD_U64(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "worker_submissions", CTLFLAG_RD,
+		&sbi->decompress_submissions, 0,
+		"Taskqueue decompression submissions") == NULL ||
+	    SYSCTL_ADD_U64(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "worker_runs", CTLFLAG_RD,
+		&sbi->decompress_worker_runs, 0,
+		"Taskqueue decompression worker runs") == NULL ||
+	    SYSCTL_ADD_UINT(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "worker_count", CTLFLAG_RD,
+		&sbi->decompress_worker_count, 0,
+		"Bounded decompression worker count") == NULL ||
+	    SYSCTL_ADD_U64(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "queue_fallbacks", CTLFLAG_RD,
+		&sbi->decompress_queue_fallbacks, 0,
+		"Direct decode after taskqueue fallback") == NULL ||
+	    SYSCTL_ADD_U8(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "worker_cpu_bound", CTLFLAG_RD,
+		(uint8_t *)&sbi->decompress_worker_cpu_bound, 0,
+		"Workers restricted to the online CPU set") == NULL ||
+	    SYSCTL_ADD_PROC(&sbi->sysctl_ctx, SYSCTL_CHILDREN(cache_node),
+		OID_AUTO, "worker_queue_priority",
+		CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sbi, 0,
+		erofs_sysctl_worker_queue_priority, "I",
+		"Decode task priority; a larger value is run first") == NULL)
+		goto fail;
+	return (0);
+
+fail:
+	error = erofs_unregister_sysfs(sbi);
+	return (error != 0 ? error : ENOMEM);
+}
+
+int
+erofs_unregister_sysfs(struct erofs_sb_info *sbi)
+{
+	int error;
+
+	if (!sbi->sysctl_registered)
+		return (0);
+	mtx_lock(&sbi->control_lock);
+	sbi->control_closing = true;
+	mtx_unlock(&sbi->control_lock);
+	error = sysctl_ctx_free(&sbi->sysctl_ctx);
+	if (error != 0) {
+		mtx_lock(&sbi->control_lock);
+		sbi->control_closing = false;
+		mtx_unlock(&sbi->control_lock);
+		return (error);
+	}
+	sbi->sysctl_registered = false;
 	return (0);
 }
