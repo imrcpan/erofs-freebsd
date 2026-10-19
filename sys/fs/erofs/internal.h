@@ -468,6 +468,18 @@ struct erofs_inode {
 	struct erofs_xattr_cache xattr_cache;
 };
 
+struct erofs_fid {
+	uint16_t len;
+	uint32_t nid_hi;
+	uint32_t nid_lo;
+	uint32_t gen;
+};
+
+_Static_assert(sizeof(struct erofs_fid) == 16,
+    "EROFS file handle ABI must be 16 bytes");
+_Static_assert(sizeof(struct erofs_fid) <= sizeof(struct fid),
+    "struct erofs_fid must fit within struct fid");
+
 #define VTOE(vp) ((struct erofs_inode *)(vp)->v_data)
 
 static inline unsigned int
@@ -496,6 +508,25 @@ erofs_nid_to_ino64(const struct erofs_sb_info *sbi, erofs_nid_t nid)
 	return ((nid << 1) & 0xffffffff00000000ULL) |
 	    (nid & 0x000000007fffffffULL) |
 	    ((nid >> EROFS_DIRENT_NID_METABOX_BIT) << 31);
+}
+
+static inline int
+erofs_ino_to_nid(const struct erofs_sb_info *sbi, ino_t ino, erofs_nid_t *nidp)
+{
+	uint64_t ino64;
+	erofs_nid_t nid;
+
+	ino64 = (uint64_t)ino;
+	if (!erofs_sb_has_metabox(sbi))
+		nid = ino64;
+	else
+		nid = ((ino64 >> 1) & UINT64_C(0x7fffffff80000000)) |
+		    (ino64 & UINT64_C(0x000000007fffffff)) |
+		    ((ino64 & UINT64_C(0x0000000080000000)) << 32);
+	if (erofs_nid_to_ino64(sbi, nid) != ino64)
+		return (EOVERFLOW);
+	*nidp = nid;
+	return (0);
 }
 
 /* Allocated on disk at m_pa. */
@@ -569,6 +600,7 @@ int erofs_vget_raw(struct mount *mp, erofs_nid_t nid, int flags,
     struct vnode **vpp);
 int erofs_vget_raw_alloc(struct mount *mp, void *arg, int flags,
     struct vnode **vpp);
+int erofs_vget(struct mount *mp, ino_t ino, int flags, struct vnode **vpp);
 
 /* Directory operations. */
 int erofs_readdir_block(struct vnode *vp, struct uio *uio, int *eofflag,
@@ -615,5 +647,9 @@ int z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
 /* Compression configuration. */
 int z_erofs_parse_cfgs(struct erofs_sb_info *sbi,
     const struct erofs_super_block *dsb);
+
+/* VOP vectors. */
+extern struct vop_vector erofs_vnodeops;
+extern struct vop_vector erofs_fifoops;
 
 #endif /* _FS_EROFS_INTERNAL_H_ */
