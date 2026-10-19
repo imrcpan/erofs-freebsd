@@ -364,3 +364,141 @@ The mount option
 .Cm worker_queue_priority .
 It can be written.
 .El
+.Sh EXAMPLES
+Mount an image from a disk device:
+.Bd -literal -offset indent
+mount -t erofs /dev/da0s1 /mnt
+.Ed
+.Pp
+Mount an image from a regular file, directly and through
+.Xr mdconfig 8 :
+.Bd -literal -offset indent
+mount -t erofs rootfs.erofs /mnt
+umount /mnt
+mdconfig -a -t vnode -f rootfs.erofs -u 0
+mount -t erofs /dev/md0 /mnt
+.Ed
+.Pp
+Mount an image that starts 1 MiB into a disk and decode in kernel threads:
+.Bd -literal -offset indent
+mount -t erofs -o fsoffset=1048576,sync_decompress=off /dev/da0 /mnt
+.Ed
+.Pp
+Mount an image whose data is partly on an external device:
+.Bd -literal -offset indent
+mount -t erofs -o device=/dev/md1 /dev/md0 /mnt
+.Ed
+.Sh DIAGNOSTICS
+If a problem with the image is found while the file system is used, the
+operation fails with
+.Er EINTEGRITY
+.Pq Dq Integrity check failed ,
+and the place where it was first noticed is written to the system log with
+.Xr log 9 :
+.Bd -literal -offset indent
+erofs (/mnt): erofs_readdir_block: invalid dirent array in the block at offset 4096 @ nid 42
+.Ed
+.Pp
+The line names the mount point, the function that found the problem, what was
+wrong and, if it concerns one inode, the number of the inode
+.Pq Dq nid .
+At most five lines a second are written for all mounts together, so a damaged
+directory cannot flood the log; every failure is still returned to the
+application.
+.Pp
+The driver does not check that an image is well formed as a whole.
+Properties such as sorted directory entries, ordered extent tables and
+non-overlapping device ranges can be checked with
+.Sy fsck.erofs
+from the erofs-utils package.
+A violation can make a lookup miss or return another entry, but cannot make
+the driver read outside the data it was asked to read.
+.Pp
+On a kernel with
+.Cd "options KDTRACE_HOOKS" ,
+the driver provides these
+.Xr dtrace 1
+probes:
+.Bl -tag -width indent
+.It Li erofs:::corrupt Ns Pq Va nid , Va line , Va error
+A problem with the image was found, whether or not it was logged.
+.Va nid
+is the number of the inode or
+.Li 0xffffffffffffffff
+if the problem does not belong to one inode,
+.Va line
+the line in the source and
+.Va error
+the error number.
+.It Li erofs:data:map_blocks:enter Ns Pq Va nid , Va la , Va llen , Va flags
+.It Li erofs:data:map_blocks:exit Ns Pq Va nid , Va la , Va pa , Va llen , Va plen , Va status
+Mapping of a logical range of an inode to its place on the device.
+.Va status
+holds the error number in its upper 32 bits and the mapping flags in the lower
+32 bits.
+.It Li erofs:data:read_folio:entry Ns Pq Va nid , Va offset , Va length , Va dir , Va raw
+.It Li erofs:data:readahead:entry Ns Pq Va nid , Va start , Va pages , Va raw
+A read or a readahead request.
+.Va offset
+and
+.Va length
+are in bytes,
+.Va start
+and
+.Va pages
+count pages,
+.Va dir
+is 1 for a directory, and
+.Va raw
+is 1 if the data is not compressed.
+.It Li erofs:inode:fill_inode:entry Ns Pq Va nid , Va blkaddr , Va offset
+An inode is read from the device.
+.It Li erofs:namei:lookup:entry Ns Pq Va dirnid , Va hash , Va length , Va flags
+A name is looked up.
+.Va hash
+is a 32-bit FNV-1a hash of the name and
+.Va flags
+are the flags of the lookup.
+.El
+.Bd -literal -offset indent
+dtrace -n 'erofs:::corrupt { printf("nid %u line %d err %d", arg0, arg1, arg2); }'
+.Ed
+.Sh SEE ALSO
+.Xr dtrace 1 ,
+.Xr kenv 1 ,
+.Xr ffs 4 ,
+.Xr loader.conf 5 ,
+.Xr mdconfig 8 ,
+.Xr mount 8 ,
+.Xr sysctl 8 ,
+.Xr umount 8 ,
+.Xr log 9
+.Sh HISTORY
+EROFS was developed for Linux by Huawei, starting in 2019.
+The
+.Fx
+driver first appeared in
+.Fx 16.0 .
+.Sh AUTHORS
+.An Ruicheng Pan
+.Sh BUGS
+The driver is read-only.
+It does not support every incompatible feature that a future version of
+the format may add, nor every encoding used for deduplication.
+The Linux mount options
+.Cm domain_id
+and
+.Cm inode_share
+are not supported.
+.Pp
+On a kernel with
+.Cd "options WITNESS" ,
+the first mount of an image file that is on an
+.Xr ffs 4
+file system logs a lock order reversal between a vnode of this driver and a
+vnode of the file system holding the image.
+It is expected: reading holds the vnode lock of this driver while it takes the
+lock of the image file, and unmounting holds the lock of the covered directory
+while it flushes the vnodes of this driver.
+Tests with concurrent reads and unmounts have not shown a deadlock, but there
+is no proof that there cannot be one.
