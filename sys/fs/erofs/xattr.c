@@ -625,6 +625,86 @@ erofs_xattr_iter_shared(struct erofs_xattr_iter *it,
 	return (get ? ENOATTR : 0);
 }
 
+int
+erofs_getxattr(struct vnode *vp, int attrnamespace, const char *name,
+    struct uio *uio, size_t *sizep)
+{
+	struct erofs_buf body = EROFS_BUF_INITIALIZER;
+	struct erofs_sb_info *sbi;
+	struct erofs_inode *vi;
+	struct erofs_xattr_ibody_header *ih;
+	struct erofs_xattr_iter it;
+	size_t header_size, name_len;
+	bool filter_negative;
+	int ret;
+
+	sbi = MTOE(vp->v_mount);
+	vi = VTOE(vp);
+	if (name == NULL || name[0] == '\0')
+		return (EINVAL);
+	name_len = strlen(name);
+	if (name_len > EROFS_NAME_LEN)
+		return (EINVAL);
+	if (vi->xattr_isize == 0)
+		return (ENOATTR);
+	ret = erofs_xattr_filter_negative(sbi, vi, attrnamespace, name,
+	    name_len, &filter_negative);
+	if (ret != 0)
+		return (ret);
+	if (filter_negative)
+		return (ENOATTR);
+	ret = erofs_xattr_load_body(sbi, vi, &body, &ih, &header_size);
+	if (ret != 0)
+		return (ret);
+	it.sbi = sbi;
+	it.vi = vi;
+	it.attrnamespace = attrnamespace;
+	it.name = name;
+	it.name_len = name_len;
+	it.uio = uio;
+	it.sizep = sizep;
+	ret = erofs_xattr_iter_inline(&it, body.data, header_size, true);
+	if (ret == ENOATTR)
+		ret = erofs_xattr_iter_shared(&it, ih, true);
+	erofs_put_metabuf(&body);
+	return (ret);
+}
+
+int
+erofs_listxattr(struct vnode *vp, int attrnamespace, struct uio *uio,
+    size_t *sizep)
+{
+	struct erofs_buf body = EROFS_BUF_INITIALIZER;
+	struct erofs_sb_info *sbi;
+	struct erofs_inode *vi;
+	struct erofs_xattr_ibody_header *ih;
+	struct erofs_xattr_iter it;
+	size_t header_size;
+	int ret;
+
+	sbi = MTOE(vp->v_mount);
+	vi = VTOE(vp);
+	if (sizep != NULL)
+		*sizep = 0;
+	if (vi->xattr_isize == 0)
+		return (0);
+	ret = erofs_xattr_load_body(sbi, vi, &body, &ih, &header_size);
+	if (ret != 0)
+		return (ret);
+	it.sbi = sbi;
+	it.vi = vi;
+	it.attrnamespace = attrnamespace;
+	it.name = NULL;
+	it.name_len = 0;
+	it.uio = uio;
+	it.sizep = sizep;
+	ret = erofs_xattr_iter_inline(&it, body.data, header_size, false);
+	if (ret == 0)
+		ret = erofs_xattr_iter_shared(&it, ih, false);
+	erofs_put_metabuf(&body);
+	return (ret);
+}
+
 static bool
 erofs_xattr_cache_reserve(struct erofs_sb_info *sbi, size_t size)
 {
