@@ -267,6 +267,7 @@ INCLUDE_CONFIG_FILE	opt_config.h
 # options in a never-included header.
 AUTOFS		opt_dontuse.h
 CD9660		opt_dontuse.h
+EROFS		opt_dontuse.h
 EXT2FS		opt_dontuse.h
 FDESCFS		opt_dontuse.h
 FFS		opt_dontuse.h

@@ -158,6 +158,12 @@ options 	COMPAT_AOUT
 options 	ZFS
 
 #####################################################################
+# EROFS support
+
+# NB: ZSTD compressed images need ZSTDIO, and POSIX ACLs need UFS_ACL.
+options 	EROFS
+
+#####################################################################
 # VM OPTIONS
 
 #

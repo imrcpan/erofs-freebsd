@@ -99,3 +99,9 @@ nooptions 	HWPMC_HOOKS
 nodevice	ccr
 nodevice	cxgbe
 nodevice	cxgbev
+
+#####################################################################
+# EROFS support
+
+# NB: ZSTD compressed images need ZSTDIO, and POSIX ACLs need UFS_ACL.
+options 	EROFS
