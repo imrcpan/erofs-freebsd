@@ -495,6 +495,7 @@ struct erofs_inode {
 
 struct erofs_fid {
 	uint16_t len;
+	uint16_t pad;
 	uint32_t nid_hi;
 	uint32_t nid_lo;
 	uint32_t gen;

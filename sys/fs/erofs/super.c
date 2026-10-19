@@ -1462,6 +1462,19 @@ out_args:
 }
 
 static int
+erofs_root(struct mount *mp, int flags, struct vnode **vpp)
+{
+	int error;
+
+	error = erofs_vget_raw(mp, MTOE(mp)->root_nid, flags, vpp);
+	if (error != 0)
+		vfs_mount_error(mp,
+		    "erofs: failed to load root nid %ju: error %d",
+		    (uintmax_t)MTOE(mp)->root_nid, error);
+	return (error);
+}
+
+static int
 erofs_statfs(struct mount *mp, struct statfs *sbp)
 {
 	struct erofs_sb_info *sbi;
@@ -1478,3 +1491,70 @@ erofs_statfs(struct mount *mp, struct statfs *sbp)
 	    0;
 	return (0);
 }
+
+static int
+erofs_unmount(struct mount *mp, int mntflags)
+{
+	struct erofs_sb_info *sbi;
+	int error, flags;
+
+	sbi = MTOE(mp);
+	if (sbi == NULL)
+		return (EINVAL);
+	flags = ((mntflags & MNT_FORCE) != 0) ? FORCECLOSE : 0;
+	error = vflush(mp, 0, flags, curthread);
+	if (error != 0)
+		return (error);
+	error = erofs_sb_free(sbi);
+	if (error != 0) {
+		return (error);
+	}
+	mp->mnt_data = NULL;
+	return (0);
+}
+
+/* Persistent EROFS file handle to locked vnode. */
+static int
+erofs_fhtovp(struct mount *mp, struct fid *fhp, int flags, struct vnode **vpp)
+{
+	struct erofs_fid efid;
+	struct erofs_inode *vi;
+	struct vnode *vp;
+	erofs_nid_t nid;
+	int error;
+
+	*vpp = NULL;
+	bzero(&efid, sizeof(efid));
+	memcpy(&efid, fhp, sizeof(efid));
+	if (efid.len != sizeof(efid) || efid.pad != 0)
+		return (EINVAL);
+	nid = ((uint64_t)efid.nid_hi << 32) | efid.nid_lo;
+	if (!erofs_nid_is_valid(MTOE(mp), nid))
+		return (ESTALE);
+	error = erofs_vget_raw(mp, nid, flags, &vp);
+	if (error != 0)
+		return (error);
+	vi = VTOE(vp);
+	if (vi->mode == 0 || vi->nlink == 0 || vi->nid != nid ||
+	    vi->generation != efid.gen) {
+		vput(vp);
+		return (ESTALE);
+	}
+	*vpp = vp;
+	return (0);
+}
+
+static struct vfsops erofs_vfsops = {
+	.vfs_fhtovp = erofs_fhtovp,
+	.vfs_mount = erofs_mount,
+	.vfs_root = erofs_root,
+	.vfs_statfs = erofs_statfs,
+	.vfs_unmount = erofs_unmount,
+	.vfs_vget = erofs_vget,
+};
+VFS_SET(erofs_vfsops, erofs, VFCF_READONLY);
+#ifdef UFS_ACL
+MODULE_DEPEND(erofs, acl_posix1e, 1, 1, 1);
+#endif
+MODULE_DEPEND(erofs, zlib, 1, 1, 1);
+MODULE_VERSION(erofs, 1);
