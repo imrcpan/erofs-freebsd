@@ -16,6 +16,17 @@
 #define EROFS_DIR_RA_HARD_MAX_BYTES (1024UL * 1024)
 #define EROFS_DIR_RA_SLOTS	    256UL
 
+enum erofs_cache_metric {
+	EROFS_CACHE_HITS,
+	EROFS_CACHE_MISSES,
+	EROFS_CACHE_BYPASSES,
+	EROFS_CACHE_EVICTIONS,
+	EROFS_CACHE_RECLAIMS,
+	EROFS_CACHE_WAITER_MERGES,
+	EROFS_CACHE_ENTRIES,
+	EROFS_CACHE_BYTES,
+};
+
 void
 erofs_management_init(struct erofs_sb_info *sbi)
 {
@@ -140,6 +151,34 @@ erofs_parse_dir_ra_option(struct erofs_sb_info *sbi, struct vfsoptlist *opts)
 }
 
 static int
+erofs_sysctl_dir_ra(SYSCTL_HANDLER_ARGS)
+{
+	struct erofs_sb_info *sbi;
+	uint64_t value;
+	int error;
+
+	sbi = arg1;
+	value = erofs_dir_ra_bytes(sbi);
+	error = sysctl_handle_64(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	return (erofs_set_dir_ra_bytes(sbi, value));
+}
+
+static int
+erofs_sysctl_dir_ra_metric(SYSCTL_HANDLER_ARGS)
+{
+	struct erofs_sb_info *sbi;
+	uint64_t value;
+
+	sbi = arg1;
+	mtx_lock(&sbi->control_lock);
+	value = arg2 == 0 ? sbi->dir_ra_requests : sbi->dir_ra_blocks;
+	mtx_unlock(&sbi->control_lock);
+	return (sysctl_handle_64(oidp, &value, 0, req));
+}
+
+static int
 erofs_validate_zip_value(const char *value, int len)
 {
 	if (value == NULL || len <= 1 || value[len - 1] != '\0' ||
@@ -235,5 +274,127 @@ erofs_parse_zip_options(struct mount *mp, struct erofs_sb_info_opts *opts,
 		vfs_deleteopt(mp->mnt_optnew, "sync_decompress");
 	if (queue_priority_present)
 		vfs_deleteopt(mp->mnt_optnew, "worker_queue_priority");
+	return (0);
+}
+
+static int
+erofs_sysctl_drop_caches(SYSCTL_HANDLER_ARGS)
+{
+	struct erofs_sb_info *sbi;
+	uint64_t value;
+	int error;
+
+	if (req->newptr == NULL)
+		return (EPERM);
+	sbi = arg1;
+	value = 0;
+	error = sysctl_handle_64(oidp, &value, 0, req);
+	if (error != 0)
+		return (error);
+	if (value != 1)
+		return (EINVAL);
+	return (z_erofs_extent_cache_drop(sbi));
+}
+
+static int
+erofs_sysctl_cache_metric(SYSCTL_HANDLER_ARGS)
+{
+	struct erofs_cache_stats stats;
+	struct erofs_sb_info *sbi;
+	uint64_t value;
+
+	sbi = arg1;
+	z_erofs_extent_cache_stats(sbi, &stats);
+	switch (arg2) {
+	case EROFS_CACHE_HITS:
+		value = stats.hits;
+		break;
+	case EROFS_CACHE_MISSES:
+		value = stats.misses;
+		break;
+	case EROFS_CACHE_BYPASSES:
+		value = stats.bypasses;
+		break;
+	case EROFS_CACHE_EVICTIONS:
+		value = stats.evictions;
+		break;
+	case EROFS_CACHE_RECLAIMS:
+		value = stats.reclaims;
+		break;
+	case EROFS_CACHE_WAITER_MERGES:
+		value = stats.waiter_merges;
+		break;
+	case EROFS_CACHE_ENTRIES:
+		value = stats.entries;
+		break;
+	case EROFS_CACHE_BYTES:
+		value = stats.bytes;
+		break;
+	default:
+		return (EINVAL);
+	}
+	return (sysctl_handle_64(oidp, &value, 0, req));
+}
+
+static int
+erofs_sysctl_zip_setting(SYSCTL_HANDLER_ARGS)
+{
+	struct erofs_sb_info *sbi;
+	int value;
+	int error;
+
+	sbi = arg1;
+	mtx_lock(&sbi->control_lock);
+	value = arg2 == 0 ? (int)sbi->sync_decompress :
+			    (int)sbi->opt.cache_strategy;
+	mtx_unlock(&sbi->control_lock);
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (arg2 == 0) {
+		if (value < EROFS_SYNC_DECOMPRESS_AUTO ||
+		    value > EROFS_SYNC_DECOMPRESS_FORCE_OFF)
+			return (EINVAL);
+	} else {
+		if (value < EROFS_ZIP_CACHE_DISABLED ||
+		    value > EROFS_ZIP_CACHE_READAROUND)
+			return (EINVAL);
+	}
+	mtx_lock(&sbi->control_lock);
+	if (sbi->control_closing) {
+		mtx_unlock(&sbi->control_lock);
+		return (ENXIO);
+	}
+	if (arg2 == 0)
+		sbi->sync_decompress = (unsigned int)value;
+	else
+		sbi->opt.cache_strategy = (uint8_t)value;
+	mtx_unlock(&sbi->control_lock);
+	return (0);
+}
+
+static int
+erofs_sysctl_worker_queue_priority(SYSCTL_HANDLER_ARGS)
+{
+	struct erofs_sb_info *sbi;
+	int error, value;
+
+	sbi = arg1;
+	mtx_lock(&sbi->control_lock);
+	value = sbi->decompress_queue_priority;
+	mtx_unlock(&sbi->control_lock);
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (value < 0 || value > UINT8_MAX)
+		return (EINVAL);
+	mtx_lock(&sbi->control_lock);
+	if (sbi->control_closing) {
+		mtx_unlock(&sbi->control_lock);
+		return (ENXIO);
+	}
+	sbi->decompress_queue_priority = (uint8_t)value;
+	sbi->opt.worker_queue_priority = (uint8_t)value;
+	mtx_unlock(&sbi->control_lock);
 	return (0);
 }
