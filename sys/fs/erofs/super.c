@@ -137,6 +137,90 @@ erofs_superblock_csum_verify(struct erofs_sb_info *sbi,
 	return (0);
 }
 
+static int
+erofs_parse_fsoffset(struct mount *mp, uint64_t *fsoffsetp, bool *presentp)
+{
+	struct vfsopt *opt;
+	const unsigned char *value;
+	uint64_t fsoffset;
+	size_t i;
+
+	*fsoffsetp = 0;
+	*presentp = false;
+	TAILQ_FOREACH(opt, mp->mnt_optnew, link) {
+		if (strcmp(opt->name, "fsoffset") != 0)
+			continue;
+		*presentp = true;
+		if (opt->value == NULL || opt->len <= 1 ||
+		    ((char *)opt->value)[opt->len - 1] != '\0')
+			goto invalid;
+		value = opt->value;
+		fsoffset = 0;
+		for (i = 0; i < (size_t)opt->len - 1; ++i) {
+			if (value[i] < '0' || value[i] > '9')
+				goto invalid;
+			if (fsoffset > (UINT64_MAX - (value[i] - '0')) / 10)
+				goto overflow;
+			fsoffset = fsoffset * 10 + (value[i] - '0');
+		}
+		*fsoffsetp = fsoffset;
+	}
+	return (0);
+
+invalid:
+	vfs_mount_error(mp, "erofs: fsoffset requires an unsigned byte offset");
+	return (EINVAL);
+overflow:
+	vfs_mount_error(mp, "erofs: fsoffset value is too large");
+	return (ERANGE);
+}
+
+static int
+erofs_parse_directio_options(struct mount *mp, bool *enabledp, bool *presentp)
+{
+	struct vfsopt *opt;
+
+	*enabledp = false;
+	*presentp = false;
+	TAILQ_FOREACH(opt, mp->mnt_optnew, link) {
+		if (strcmp(opt->name, "directio") != 0 &&
+		    strcmp(opt->name, "nodirectio") != 0)
+			continue;
+		if (opt->value != NULL || opt->len != 0) {
+			vfs_mount_error(mp,
+			    "erofs: directio/nodirectio take no value");
+			return (EINVAL);
+		}
+		*presentp = true;
+		*enabledp = strcmp(opt->name, "directio") == 0;
+	}
+	return (0);
+}
+
+static int
+erofs_parse_zip_mount_options(struct mount *mp,
+    struct erofs_sb_info_opts *opts __unused, unsigned int *syncp __unused,
+    bool *cache_presentp, bool *sync_presentp, bool *priority_presentp)
+{
+	struct vfsopt *opt;
+	int error;
+
+	*priority_presentp = false;
+	TAILQ_FOREACH(opt, mp->mnt_optnew, link) {
+		if (strcmp(opt->name, "worker_queue_priority") == 0)
+			*priority_presentp = true;
+	}
+	error = erofs_parse_zip_options(mp, opts, syncp, cache_presentp,
+	    sync_presentp);
+	if (error != 0) {
+		vfs_mount_error(mp,
+		    "erofs: invalid cache_strategy, sync_decompress, or "
+		    "worker_queue_priority option");
+		return (error);
+	}
+	return (0);
+}
+
 #define EROFS_DEVICE_OPT_PREFIX "device."
 
 struct erofs_device_arg {
@@ -315,6 +399,86 @@ erofs_reject_device_update(struct mount *mp)
 		return (EOPNOTSUPP);
 	}
 	return (0);
+}
+
+static int
+erofs_parse_acl_options(struct mount *mp, bool default_enabled, bool *enabledp)
+{
+	struct vfsopt *opt;
+	bool enabled;
+
+	enabled = default_enabled;
+	TAILQ_FOREACH(opt, mp->mnt_optnew, link) {
+		if (strcmp(opt->name, "acl") != 0 &&
+		    strcmp(opt->name, "noacl") != 0)
+			continue;
+		if (opt->value != NULL || opt->len != 0) {
+			vfs_mount_error(mp, "erofs: acl/noacl take no value");
+			return (EINVAL);
+		}
+#ifdef UFS_ACL
+		enabled = strcmp(opt->name, "acl") == 0;
+#else
+		vfs_mount_error(mp, "erofs: POSIX ACL support is not built");
+		return (EOPNOTSUPP);
+#endif
+	}
+#ifndef UFS_ACL
+	enabled = false;
+#endif
+	*enabledp = enabled;
+	return (0);
+}
+
+static int
+erofs_parse_xattr_options(struct mount *mp, bool default_enabled,
+    bool *enabledp)
+{
+	struct vfsopt *opt;
+	bool enabled;
+
+	enabled = default_enabled;
+	TAILQ_FOREACH(opt, mp->mnt_optnew, link) {
+		if (strcmp(opt->name, "user_xattr") != 0 &&
+		    strcmp(opt->name, "nouser_xattr") != 0)
+			continue;
+		if (opt->value != NULL || opt->len != 0) {
+			vfs_mount_error(mp,
+			    "erofs: user_xattr/nouser_xattr take no value");
+			return (EINVAL);
+		}
+		enabled = strcmp(opt->name, "user_xattr") == 0;
+	}
+	*enabledp = enabled;
+	return (0);
+}
+
+static void
+erofs_set_xattr_state(struct erofs_sb_info *sbi, bool enabled)
+{
+	if (enabled)
+		set_opt(&sbi->opt, XATTR_USER);
+	else
+		clear_opt(&sbi->opt, XATTR_USER);
+}
+
+static void
+erofs_set_acl_state(struct erofs_sb_info *sbi, bool enabled)
+{
+	struct mount *mp;
+
+	mp = sbi->mnt;
+	if (enabled) {
+		set_opt(&sbi->opt, POSIX_ACL);
+		MNT_ILOCK(mp);
+		mp->mnt_flag |= MNT_ACLS;
+		MNT_IUNLOCK(mp);
+	} else {
+		MNT_ILOCK(mp);
+		mp->mnt_flag &= ~MNT_ACLS;
+		MNT_IUNLOCK(mp);
+		clear_opt(&sbi->opt, POSIX_ACL);
+	}
 }
 
 struct erofs_device_handle {

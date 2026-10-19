@@ -152,6 +152,9 @@ _Static_assert(PAGE_SHIFT <= 16, "EROFS block sizes are at most 64 KiB");
 #define EROFS_MOUNT_POSIX_ACL  0x00000020
 #define EROFS_MOUNT_XATTR_USER 0x00000080
 #define EROFS_MOUNT_DIRECT_IO  0x00000100
+
+#define clear_opt(opt, option) ((opt)->mount_opt &= ~EROFS_MOUNT_##option)
+#define set_opt(opt, option)   ((opt)->mount_opt |= EROFS_MOUNT_##option)
 #define test_opt(opt, option)  ((opt)->mount_opt & EROFS_MOUNT_##option)
 
 struct erofs_sb_info_opts {
