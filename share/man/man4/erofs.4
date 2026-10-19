@@ -226,3 +226,141 @@ and
 are rejected with
 .Er EOPNOTSUPP
 because the devices of a mounted file system cannot change.
+.Sh LOADER TUNABLES
+These tunables are read when the driver is loaded.
+Set them in
+.Xr loader.conf 5 ,
+or with
+.Xr kenv 1
+before the module is loaded.
+Every limit has a compiled-in maximum, and a larger value is reduced to it.
+.Bl -tag -width indent
+.It Va vfs.erofs.decoded_cache.enabled
+Set to 0 to turn off the cache of decoded extents for all mounts.
+The default is 1.
+.It Va vfs.erofs.decoded_cache.mount_budget
+The size in bytes of the decoded extent cache of one mount.
+The maximum, and the default, is 256 KiB.
+.It Va vfs.erofs.decoded_cache.global_budget
+The size in bytes of the decoded extent caches of all mounts together.
+The maximum, and the default, is 512 KiB.
+.It Va vfs.erofs.decoded_cache.minimum_decode_work
+Extents that are cheaper to decode than this many bytes of input and output
+are not cached.
+The default is 128 KiB.
+.It Va vfs.erofs.decoded_cache.worker_limit
+The number of decode threads that each mount starts.
+It is reduced to 8 and to the number of CPUs, and is at least 1.
+The default is 8.
+.It Va vfs.erofs.stream_pool.mount_budget
+Decompressor contexts are kept in a pool.
+This is the largest amount of memory in bytes that the contexts of one mount
+may use.
+The maximum, and the default, is 32 MiB.
+.It Va vfs.erofs.stream_pool.global_budget
+The same for all mounts together.
+The maximum, and the default, is 128 MiB.
+.It Va vfs.erofs.stream_pool.mount_contexts
+The most contexts of one mount and one algorithm.
+The maximum, and the default, is 16.
+.It Va vfs.erofs.stream_pool.global_contexts
+The most contexts of all mounts together.
+The maximum, and the default, is 64.
+.It Va vfs.erofs.stream_pool.mount_cached_per_codec
+How many idle contexts of each algorithm a mount keeps.
+The default is 2.
+.It Va vfs.erofs.stream_pool.global_cached_per_codec
+How many idle contexts of each algorithm all mounts keep together.
+The default is 16.
+.El
+.Sh SYSCTL VARIABLES
+The pool of decompressor contexts is described by these read-only variables.
+.Bl -tag -width indent -compact
+.It Va vfs.erofs.stream_pool.mount_budget
+.It Va vfs.erofs.stream_pool.global_budget
+.It Va vfs.erofs.stream_pool.mount_contexts
+.It Va vfs.erofs.stream_pool.global_contexts_limit
+The limits in effect, after the tunables above have been applied.
+.It Va vfs.erofs.stream_pool.resident_bytes
+The memory used by all contexts.
+.It Va vfs.erofs.stream_pool.contexts
+The number of allocated contexts.
+.It Va vfs.erofs.stream_pool.cached
+.It Va vfs.erofs.stream_pool.borrowed
+.It Va vfs.erofs.stream_pool.idle
+The number of cacheable contexts, of contexts that are in use, and of
+contexts that are idle.
+.It Va vfs.erofs.stream_pool.creations
+.It Va vfs.erofs.stream_pool.reuses
+.It Va vfs.erofs.stream_pool.destroys
+.It Va vfs.erofs.stream_pool.reclaims
+Contexts created, taken from the idle list, destroyed, and released because the
+system was low on memory.
+.It Va vfs.erofs.stream_pool.fallbacks
+.It Va vfs.erofs.stream_pool.exhaustions
+.It Va vfs.erofs.stream_pool.waits
+Temporary contexts used because the pool was full, requests refused because
+of a limit, and sleeps for a context to be released.
+.El
+.Pp
+Every mount has a node
+.Va vfs.erofs.mounts\&. Ns Ar id ,
+where
+.Ar id
+is shown by the read-only
+.Va mount_id
+variable in it.
+The node contains:
+.Bl -tag -width indent -compact
+.It Va dir_ra_bytes
+The directory readahead, as the mount option.
+It can be written.
+.It Va dir_ra_max_bytes
+The largest value that
+.Va dir_ra_bytes
+accepts.
+.It Va dir_ra_requests
+.It Va dir_ra_blocks
+The number of directory readahead requests and of blocks they asked for.
+.It Va sync_decompress
+.It Va cache_strategy
+The mount options of the same name as numbers: 0 to 2 for
+.Va sync_decompress
+.Pq auto, on, off
+and 0 to 2 for
+.Va cache_strategy
+.Pq disabled, readahead, readaround .
+They can be written.
+.It Va drop_caches
+Write 1 to discard the decoded extents of the mount.
+.It Va decoded_cache.hits
+.It Va decoded_cache.misses
+.It Va decoded_cache.bypasses
+.It Va decoded_cache.evictions
+.It Va decoded_cache.reclaims
+.It Va decoded_cache.waiter_merges
+Counters of the decoded extent cache: lookups that found an extent, lookups
+that did not, extents that were not eligible for the cache, extents removed to
+make room, extents removed because the system was low on memory, and readers
+that waited for another reader to decode the same extent.
+.It Va decoded_cache.entries
+.It Va decoded_cache.bytes
+The number of extents in the cache and the memory they use.
+.It Va decoded_cache.worker_submissions
+.It Va decoded_cache.worker_runs
+.It Va decoded_cache.queue_fallbacks
+The number of decoding tasks given to the decode threads, the number of tasks
+they ran, and the number of times the reading thread decoded the data itself
+although
+.Cm sync_decompress=off
+was set, because there was no queue, the reader was a decode thread, or
+queuing the task failed.
+.It Va decoded_cache.worker_count
+.It Va decoded_cache.worker_cpu_bound
+The number of decode threads and whether they are restricted to the online
+CPUs.
+.It Va decoded_cache.worker_queue_priority
+The mount option
+.Cm worker_queue_priority .
+It can be written.
+.El
