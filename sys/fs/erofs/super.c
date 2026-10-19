@@ -1192,3 +1192,95 @@ erofs_read_superblock(struct erofs_sb_info *sbi, struct erofs_super_block *dsb)
 
 	return (z_erofs_parse_cfgs(sbi, dsb));
 }
+
+static int
+erofs_mountfs(struct erofs_device_info *primary, struct mount *mp,
+    const struct erofs_device_arg *args, unsigned int arg_count,
+    bool xattr_user_enabled, bool acl_enabled, bool directio_enabled)
+{
+	struct erofs_sb_info *sbi;
+	struct erofs_inode root;
+	struct erofs_super_block dsb;
+	bool cache_present, sync_present, priority_present;
+	int cleanup_error, error;
+
+	sbi = malloc(sizeof(*sbi), M_EROFS, M_WAITOK | M_ZERO);
+	sbi->mnt = mp;
+	erofs_management_init(sbi);
+	sbi->opt.cache_strategy = EROFS_ZIP_CACHE_READAROUND;
+	sbi->sync_decompress = EROFS_SYNC_DECOMPRESS_AUTO;
+	error = erofs_parse_zip_mount_options(mp, &sbi->opt,
+	    &sbi->sync_decompress, &cache_present, &sync_present,
+	    &priority_present);
+	if (error != 0)
+		goto fail;
+	mtx_lock(&sbi->control_lock);
+	sbi->decompress_queue_priority = sbi->opt.worker_queue_priority;
+	mtx_unlock(&sbi->control_lock);
+	z_erofs_extent_cache_init(sbi);
+	z_erofs_stream_pool_init(sbi);
+	sbi->dif0 = *primary;
+	bzero(primary, sizeof(*primary));
+	if (directio_enabled)
+		set_opt(&sbi->opt, DIRECT_IO);
+	error = erofs_register_source_upper(sbi, &sbi->dif0);
+	if (error != 0)
+		goto fail;
+
+	error = erofs_read_superblock(sbi, &dsb);
+	if (error != 0)
+		goto fail;
+	error = erofs_parse_dir_ra_option(sbi, mp->mnt_optnew);
+	if (error != 0) {
+		vfs_mount_error(mp, "erofs: invalid dir_ra_bytes option");
+		goto fail;
+	}
+	vfs_deleteopt(mp->mnt_optnew, "dir_ra_bytes");
+	error = erofs_scan_devices(sbi, &dsb, args, arg_count);
+	if (error != 0)
+		goto fail;
+
+	error = erofs_init_packed_inode(sbi);
+	if (error != 0)
+		goto fail;
+	error = erofs_init_metabox_inode(sbi);
+	if (error != 0)
+		goto fail;
+	error = erofs_read_inode(sbi, sbi->root_nid, &root);
+	if (error != 0)
+		goto fail;
+	if (root.vtype != VDIR) {
+		vfs_mount_error(mp,
+		    "erofs: root inode nid=%ju is not a directory",
+		    (uintmax_t)sbi->root_nid);
+		error = EINVAL;
+		goto fail;
+	}
+	error = erofs_xattr_prefixes_init(sbi);
+	if (error != 0)
+		goto fail;
+
+	mp->mnt_data = sbi;
+	if (sbi->dif0.source_kind == EROFS_SOURCE_FILE)
+		vfs_getnewfsid(mp);
+	else {
+		mp->mnt_stat.f_fsid.val[0] = dev2udev(sbi->dif0.devvp->v_rdev);
+		mp->mnt_stat.f_fsid.val[1] = mp->mnt_vfc->vfc_typenum;
+	}
+	MNT_ILOCK(mp);
+	mp->mnt_flag |= MNT_LOCAL | MNT_RDONLY;
+	mp->mnt_kern_flag |= MNTK_LOOKUP_SHARED | MNTK_EXTENDED_SHARED |
+	    MNTK_USES_BCACHE;
+	MNT_IUNLOCK(mp);
+	erofs_set_xattr_state(sbi, xattr_user_enabled);
+	erofs_set_acl_state(sbi, acl_enabled);
+	error = erofs_register_sysfs(sbi);
+	if (error != 0)
+		goto fail;
+	return (0);
+fail:
+	cleanup_error = erofs_sb_free(sbi);
+	if (mp->mnt_data == sbi)
+		mp->mnt_data = NULL;
+	return (cleanup_error != 0 ? cleanup_error : error);
+}
