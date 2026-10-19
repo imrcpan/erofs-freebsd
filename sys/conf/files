@@ -3667,6 +3667,24 @@ fs/devfs/devfs_dir.c		standard
 fs/devfs/devfs_rule.c		standard
 fs/devfs/devfs_vfsops.c		standard
 fs/devfs/devfs_vnops.c		standard
+fs/erofs/data.c		optional erofs
+fs/erofs/decompressor.c		optional erofs
+fs/erofs/decompressor_deflate.c	optional erofs
+fs/erofs/decompressor_lz4.c	optional erofs
+fs/erofs/decompressor_lzma.c	optional erofs compile-with "${NORMAL_C} -DXZ_USE_CRC64 -I$S/contrib/xz-embedded/freebsd/ -I$S/contrib/xz-embedded/linux/lib/xz/ -I$S/contrib/xz-embedded/linux/include/linux/"
+fs/erofs/decompressor_zstd.c	optional erofs compile-with "${NORMAL_C} -I$S/contrib/zstd/lib/freebsd"
+fs/erofs/dir.c		optional erofs
+fs/erofs/erofs_vnops.c		optional erofs
+fs/erofs/fileio.c		optional erofs
+fs/erofs/inode.c		optional erofs
+fs/erofs/namei.c		optional erofs
+fs/erofs/super.c		optional erofs
+fs/erofs/sysfs.c		optional erofs
+fs/erofs/trace.c		optional erofs
+fs/erofs/xattr.c		optional erofs
+fs/erofs/zdata.c		optional erofs
+fs/erofs/zmap.c		optional erofs
+fs/erofs/erofs_zutil.c		optional erofs
 fs/fdescfs/fdesc_vfsops.c	optional fdescfs
 fs/fdescfs/fdesc_vnops.c	optional fdescfs
 fs/fifofs/fifo_vnops.c		standard
@@ -4214,39 +4232,39 @@ libkern/strtouq.c		standard
 libkern/strvalid.c		standard
 libkern/timingsafe_bcmp.c	standard
 contrib/zlib/adler32.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib \
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs \
 	compile-with "${ZLIB_C}"
 contrib/zlib/compress.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib \
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs \
 	compile-with "${ZLIB_C}"
 contrib/zlib/crc32.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib \
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs \
 	compile-with "${ZLIB_C}"
 contrib/zlib/deflate.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib \
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs \
 	compile-with "${ZLIB_C}"
 contrib/zlib/inffast.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib \
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs \
 	compile-with "${ZLIB_C}"
 contrib/zlib/inflate.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib \
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs \
 	compile-with "${ZLIB_C}"
 contrib/zlib/inftrees.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib \
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs \
 	compile-with "${ZLIB_C}"
 contrib/zlib/trees.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib \
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs \
 	compile-with "${ZLIB_C}"
 contrib/zlib/uncompr.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib \
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs \
 	compile-with "${ZLIB_C}"
 contrib/zlib/zutil.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib \
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs \
 	compile-with "${ZLIB_C}"
 dev/zlib/zlib_mod.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs
 dev/zlib/zcalloc.c		optional crypto | geom_uzip | \
-	mxge | ddb_ctf | gzio | zfs | zlib
+	mxge | ddb_ctf | gzio | zfs | zlib | erofs
 net/altq/altq_cbq.c		optional altq
 net/altq/altq_codel.c		optional altq
 net/altq/altq_hfsc.c		optional altq
