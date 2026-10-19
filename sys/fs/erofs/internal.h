@@ -204,6 +204,12 @@ erofs_source_is_file(const struct erofs_device_info *dif)
 	    erofs_source_is_open(dif) && dif->source_kind == EROFS_SOURCE_FILE);
 }
 
+struct erofs_xattr_prefix_item {
+	uint8_t base_index;
+	uint8_t infix_len;
+	char *infix;
+};
+
 struct erofs_map_blocks {
 	erofs_off_t m_pa, m_la;
 	uint64_t m_plen, m_llen;
@@ -348,10 +354,12 @@ struct erofs_sb_info {
 	uint32_t sb_size;
 	uint8_t blkszbits;
 	uint32_t meta_blkaddr;
+	uint8_t xattr_prefix_count;
 	uint8_t xattr_filter_reserved;
 	erofs_nid_t packed_nid;
 	struct erofs_inode *metabox_en;
 	struct erofs_inode *packed_inode;
+	struct erofs_xattr_prefix_item *xattr_prefixes;
 	erofs_blk_t blocks;
 	erofs_nid_t root_nid;
 	int64_t epoch;

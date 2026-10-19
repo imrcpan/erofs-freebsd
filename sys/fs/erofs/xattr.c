@@ -236,6 +236,16 @@ erofs_xattr_read_metadata(struct erofs_sb_info *sbi,
 }
 
 static int
+erofs_xattr_move(void *value, size_t value_size, struct uio *uio, size_t *sizep)
+{
+	if (sizep != NULL)
+		*sizep = value_size;
+	if (uio == NULL || value_size == 0)
+		return (0);
+	return (uiomove(value, value_size, uio));
+}
+
+static int
 erofs_xattr_load_body_uncached(struct erofs_sb_info *sbi,
     struct erofs_inode *vi, struct erofs_buf *bodybuf,
     struct erofs_xattr_ibody_header **ihp, size_t *header_sizep)
@@ -278,6 +288,138 @@ erofs_xattr_load_body_uncached(struct erofs_sb_info *sbi,
 fail:
 	erofs_put_metabuf(&buf);
 	return (error);
+}
+
+static bool
+erofs_xattr_prefix(uint8_t base_index, int *namespacep, const char **prefixp,
+    size_t *prefix_lenp)
+{
+	switch (base_index) {
+	case EROFS_XATTR_INDEX_USER:
+		*namespacep = EXTATTR_NAMESPACE_USER;
+		*prefixp = NULL;
+		*prefix_lenp = 0;
+		return (true);
+#ifdef UFS_ACL
+	case EROFS_XATTR_INDEX_POSIX_ACL_ACCESS:
+		*namespacep = EXTATTR_NAMESPACE_SYSTEM;
+		*prefixp = "posix_acl_access";
+		*prefix_lenp = sizeof("posix_acl_access") - 1;
+		return (true);
+	case EROFS_XATTR_INDEX_POSIX_ACL_DEFAULT:
+		*namespacep = EXTATTR_NAMESPACE_SYSTEM;
+		*prefixp = "posix_acl_default";
+		*prefix_lenp = sizeof("posix_acl_default") - 1;
+		return (true);
+#endif
+	case EROFS_XATTR_INDEX_TRUSTED:
+		*namespacep = EXTATTR_NAMESPACE_SYSTEM;
+		*prefixp = "trusted.";
+		*prefix_lenp = sizeof("trusted.") - 1;
+		return (true);
+	case EROFS_XATTR_INDEX_SECURITY:
+		*namespacep = EXTATTR_NAMESPACE_SYSTEM;
+		*prefixp = "security.";
+		*prefix_lenp = sizeof("security.") - 1;
+		return (true);
+	case EROFS_XATTR_INDEX_LUSTRE:
+	default:
+		return (false);
+	}
+}
+
+static int
+erofs_xattr_namespace_prefix(int attrnamespace, uint8_t base_index,
+    const char **prefixp, size_t *prefix_lenp)
+{
+	int mapped_namespace;
+
+	if (attrnamespace != EXTATTR_NAMESPACE_USER &&
+	    attrnamespace != EXTATTR_NAMESPACE_SYSTEM)
+		return (EOPNOTSUPP);
+	if (!erofs_xattr_prefix(base_index, &mapped_namespace, prefixp,
+		prefix_lenp))
+		return (ENOATTR);
+	if (mapped_namespace != attrnamespace)
+		return (ENOATTR);
+	return (0);
+}
+
+static int
+erofs_xattr_list_move(const char *namespace_prefix, size_t namespace_prefix_len,
+    const char *infix, size_t infix_len, const char *name, uint8_t name_len,
+    struct uio *uio, size_t *sizep)
+{
+	uint8_t total_name_len;
+	int error;
+
+	if (namespace_prefix_len + infix_len + name_len > EROFS_NAME_LEN)
+		return (EINTEGRITY);
+	total_name_len = namespace_prefix_len + infix_len + name_len;
+	if (sizep != NULL) {
+		*sizep += total_name_len + 1;
+		return (0);
+	}
+	if (uio == NULL)
+		return (0);
+	error = uiomove(__DECONST(void *, &total_name_len), 1, uio);
+	if (error != 0)
+		return (error);
+	if (namespace_prefix_len != 0) {
+		error = uiomove(__DECONST(void *, namespace_prefix),
+		    namespace_prefix_len, uio);
+		if (error != 0)
+			return (error);
+	}
+	if (infix_len != 0) {
+		error = uiomove(__DECONST(void *, infix), infix_len, uio);
+		if (error != 0)
+			return (error);
+	}
+	return (uiomove(__DECONST(void *, name), name_len, uio));
+}
+
+static int
+erofs_xattr_resolve_name(struct erofs_sb_info *sbi,
+    const struct erofs_xattr_entry *entry, uint8_t *base_indexp,
+    const char **infixp, size_t *infix_lenp)
+{
+	struct erofs_xattr_prefix_item *prefix;
+	uint8_t prefix_id;
+
+	if ((entry->e_name_index & EROFS_XATTR_LONG_PREFIX) == 0) {
+		*base_indexp = entry->e_name_index;
+		*infixp = NULL;
+		*infix_lenp = 0;
+		return (0);
+	}
+	if (sbi->xattr_prefixes == NULL)
+		return (ENOATTR);
+	prefix_id = entry->e_name_index & EROFS_XATTR_LONG_PREFIX_MASK;
+	if (prefix_id >= sbi->xattr_prefix_count)
+		return (ENOATTR);
+	prefix = &sbi->xattr_prefixes[prefix_id];
+	*base_indexp = prefix->base_index;
+	*infixp = prefix->infix;
+	*infix_lenp = prefix->infix_len;
+	return (0);
+}
+
+static bool
+erofs_xattr_name_match(const char *namespace_prefix,
+    size_t namespace_prefix_len, const char *infix, size_t infix_len,
+    const struct erofs_xattr_entry *entry, const char *name, size_t name_len)
+{
+	if (name_len != namespace_prefix_len + infix_len + entry->e_name_len)
+		return (false);
+	if (namespace_prefix_len != 0 &&
+	    memcmp(name, namespace_prefix, namespace_prefix_len) != 0)
+		return (false);
+	if (infix_len != 0 &&
+	    memcmp(name + namespace_prefix_len, infix, infix_len) != 0)
+		return (false);
+	return (memcmp(name + namespace_prefix_len + infix_len, entry->e_name,
+		    entry->e_name_len) == 0);
 }
 
 static bool
