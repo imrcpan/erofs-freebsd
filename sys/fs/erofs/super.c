@@ -105,6 +105,118 @@ struct erofs_device_handle {
 	volatile u_int refs;
 };
 
+/*
+ * A block-backed primary device may come with file-backed extra devices.
+ */
+static bool
+erofs_mount_has_file_source(const struct erofs_sb_info *sbi)
+{
+	unsigned int i;
+
+	if (erofs_source_is_file(&sbi->dif0))
+		return (true);
+	for (i = 0; i < sbi->extra_devices; ++i) {
+		if (erofs_source_is_file(&sbi->devs[i]))
+			return (true);
+	}
+	return (false);
+}
+
+/*
+ * Judge the mount that really holds the data.  VOP_GETLOWVNODE() looks
+ * through nullfs and unionfs; where it cannot, unionfs is refused by name.
+ */
+static int
+erofs_check_source_stacking(struct erofs_sb_info *sbi, struct vnode *devvp)
+{
+	struct erofs_sb_info *lower;
+	struct vnode *lowvp;
+	struct mount *lowmp;
+	int error;
+
+	error = VOP_GETLOWVNODE(devvp, &lowvp, FREAD);
+	if (error != 0)
+		return (error);
+	lowmp = lowvp->v_mount;
+	error = 0;
+	if (lowmp == NULL) {
+		vfs_mount_error(sbi->mnt,
+		    "erofs: file-backed source filesystem is being unmounted");
+		error = EBUSY;
+	} else if (strcmp(lowmp->mnt_vfc->vfc_name, "unionfs") == 0) {
+		vfs_mount_error(sbi->mnt,
+		    "erofs: file-backed mounts cannot be applied to stacked "
+		    "fses");
+		error = ENOTBLK;
+	} else if (lowmp->mnt_vfc == sbi->mnt->mnt_vfc) {
+		lower = lowmp->mnt_data;
+		if (lower != NULL && erofs_mount_has_file_source(lower)) {
+			vfs_mount_error(sbi->mnt,
+			    "erofs: file-backed mounts cannot be applied to "
+			    "file-backed EROFS mounts");
+			error = ENOTBLK;
+		}
+	}
+	vrele(lowvp);
+	return (error);
+}
+
+static int
+erofs_register_source_upper(struct erofs_sb_info *sbi,
+    struct erofs_device_info *dif)
+{
+	struct mount *source_mnt, *covered_mnt;
+	struct mount *source_mp;
+	int error;
+
+	if (!erofs_source_is_file(dif))
+		return (0);
+	if (sbi == NULL || sbi->mnt == NULL || dif->handle == NULL ||
+	    dif->devvp == NULL)
+		return (EINVAL);
+	/*
+	 * Reject these before registering, which asserts that the lower mount
+	 * is not the one being built.
+	 */
+	source_mnt = dif->devvp->v_mount;
+	if (source_mnt == sbi->mnt) {
+		vfs_mount_error(sbi->mnt,
+		    "erofs: file-backed source resolves to the mount being "
+		    "built");
+		return (EDEADLK);
+	}
+	covered_mnt = sbi->mnt->mnt_vnodecovered != NULL ?
+	    sbi->mnt->mnt_vnodecovered->v_mount :
+	    NULL;
+	if (covered_mnt != NULL && source_mnt == covered_mnt &&
+	    source_mnt->mnt_vfc == sbi->mnt->mnt_vfc) {
+		vfs_mount_error(sbi->mnt,
+		    "erofs: file-backed source and mount target are on the "
+		    "same mount");
+		return (ELOOP);
+	}
+	source_mp = vfs_register_upper_from_vp(dif->devvp, sbi->mnt,
+	    &dif->handle->source_upper);
+	if (source_mp == NULL) {
+		vfs_mount_error(sbi->mnt,
+		    "erofs: file-backed source filesystem is being unmounted");
+		return (EBUSY);
+	}
+	dif->handle->source_mp = source_mp;
+	/*
+	 * Registering pins source_mp until this mount is torn down.  Reading
+	 * a file-backed source re-enters VOP_READ on it, so another
+	 * file-backed EROFS level is refused.
+	 */
+	error = erofs_check_source_stacking(sbi, dif->devvp);
+	if (error != 0) {
+		vfs_unregister_upper(source_mp, &dif->handle->source_upper);
+		dif->handle->source_mp = NULL;
+		return (error);
+	}
+	return (0);
+}
+
 static void
 erofs_destroy_device_handle(struct erofs_device_handle *handle)
 {
