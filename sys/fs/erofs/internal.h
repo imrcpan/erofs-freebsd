@@ -349,6 +349,13 @@ struct erofs_sb_info {
 	struct mount *mnt;
 	struct erofs_device_info dif0;
 	struct mtx control_lock;
+	uint64_t dir_ra_bytes;
+	uint64_t dir_ra_max_bytes;
+	uint64_t dir_ra_requests;
+	uint64_t dir_ra_blocks;
+	bool control_initialized;
+	bool sysctl_registered;
+	bool control_closing;
 
 	uint32_t block_size;
 	uint32_t sb_size;
@@ -583,6 +590,7 @@ int erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 int erofs_read_data_readahead(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     erofs_off_t loff, size_t len, bool sequential, void **bufp);
 uint64_t erofs_dir_ra_bytes(struct erofs_sb_info *sbi);
+int erofs_set_dir_ra_bytes(struct erofs_sb_info *sbi, uint64_t value);
 void erofs_record_dir_readahead(struct erofs_sb_info *sbi, unsigned int blocks);
 int erofs_read_file(struct vnode *vp, struct uio *uio);
 int erofs_file_llseek(struct vnode *vp, off_t *offset, bool seek_data);
@@ -647,6 +655,13 @@ int z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
 /* Compression configuration. */
 int z_erofs_parse_cfgs(struct erofs_sb_info *sbi,
     const struct erofs_super_block *dsb);
+
+int erofs_parse_dir_ra_option(struct erofs_sb_info *sbi,
+    struct vfsoptlist *opts);
+int erofs_parse_dir_ra_value(struct erofs_sb_info *sbi, struct vfsoptlist *opts,
+    uint64_t *valuep, bool *presentp);
+void erofs_management_init(struct erofs_sb_info *sbi);
+void erofs_management_fini(struct erofs_sb_info *sbi);
 
 /* VOP vectors. */
 extern struct vop_vector erofs_vnodeops;
