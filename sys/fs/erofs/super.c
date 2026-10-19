@@ -137,6 +137,36 @@ erofs_superblock_csum_verify(struct erofs_sb_info *sbi,
 	return (0);
 }
 
+static const char *erofs_opts[] = {
+	"acl",
+	"device",
+	"export",
+	"from",
+	"dir_ra_bytes",
+	"directio",
+	"cache_strategy",
+	"sync_decompress",
+	"worker_queue_priority",
+	"fsoffset",
+	"nodirectio",
+	"user_xattr",
+	/* Generic VFS options that other file systems accept. */
+	"async",
+	"noatime",
+	"noclusterr",
+	"noclusterw",
+	"nosymfollow",
+	"sync",
+	"union",
+	NULL,
+};
+
+static vfs_mount_t erofs_mount;
+static vfs_root_t erofs_root;
+static vfs_statfs_t erofs_statfs;
+static vfs_unmount_t erofs_unmount;
+static vfs_fhtovp_t erofs_fhtovp;
+
 static int
 erofs_parse_fsoffset(struct mount *mp, uint64_t *fsoffsetp, bool *presentp)
 {
@@ -1283,4 +1313,168 @@ fail:
 	if (mp->mnt_data == sbi)
 		mp->mnt_data = NULL;
 	return (cleanup_error != 0 ? cleanup_error : error);
+}
+
+static int
+erofs_mount(struct mount *mp)
+{
+	struct erofs_device_arg *args;
+	struct erofs_device_info primary;
+	struct erofs_sb_info *sbi;
+	struct erofs_sb_info_opts next_opt;
+	char *fspec;
+	uint64_t fsoffset, new_dir_ra;
+	unsigned int next_sync;
+	unsigned int arg_count;
+	bool directio_enabled, directio_present;
+	bool fsoffset_present, xattr_user_enabled, acl_enabled;
+	bool cache_present, sync_present, priority_present, dir_ra_present;
+	int error, len;
+
+	MNT_ILOCK(mp);
+	mp->mnt_flag |= MNT_RDONLY;
+	MNT_IUNLOCK(mp);
+	if (mp->mnt_flag & MNT_UPDATE) {
+		sbi = MTOE(mp);
+		if (sbi == NULL)
+			return (EINVAL);
+		if (mp->mnt_flag & MNT_RELOAD)
+			return (EOPNOTSUPP);
+		error = erofs_reject_device_update(mp);
+		if (error != 0)
+			return (error);
+		error = erofs_parse_fsoffset(mp, &fsoffset, &fsoffset_present);
+		if (error != 0)
+			goto update_fail;
+		error = erofs_parse_directio_options(mp, &directio_enabled,
+		    &directio_present);
+		if (error != 0)
+			goto update_fail;
+		if (fsoffset_present && fsoffset != sbi->dif0.fsoff) {
+			vfs_mount_error(mp,
+			    "erofs: fsoffset cannot be changed on update");
+			error = EOPNOTSUPP;
+			goto update_fail;
+		}
+		error = vfs_filteropt(mp->mnt_optnew, erofs_opts);
+		if (error != 0)
+			goto update_fail;
+		mtx_lock(&sbi->control_lock);
+		bzero(&next_opt, sizeof(next_opt));
+		next_opt.cache_strategy = sbi->opt.cache_strategy;
+		next_opt.worker_queue_priority = sbi->opt.worker_queue_priority;
+		next_sync = sbi->sync_decompress;
+		mtx_unlock(&sbi->control_lock);
+		error = erofs_parse_zip_mount_options(mp, &next_opt, &next_sync,
+		    &cache_present, &sync_present, &priority_present);
+		if (error != 0)
+			goto update_fail;
+		error = erofs_parse_acl_options(mp,
+		    test_opt(&sbi->opt, POSIX_ACL) != 0, &acl_enabled);
+		if (error != 0)
+			goto update_fail;
+		error = erofs_parse_xattr_options(mp,
+		    test_opt(&sbi->opt, XATTR_USER) != 0, &xattr_user_enabled);
+		if (error != 0)
+			goto update_fail;
+		new_dir_ra = 0;
+		error = erofs_parse_dir_ra_value(sbi, mp->mnt_optnew,
+		    &new_dir_ra, &dir_ra_present);
+		if (error != 0) {
+			vfs_mount_error(mp,
+			    "erofs: invalid dir_ra_bytes option");
+			goto update_fail;
+		}
+		vfs_deleteopt(mp->mnt_optnew, "dir_ra_bytes");
+		if (dir_ra_present) {
+			error = erofs_set_dir_ra_bytes(sbi, new_dir_ra);
+			if (error != 0)
+				goto update_fail;
+		}
+		mtx_lock(&sbi->control_lock);
+		if (cache_present)
+			sbi->opt.cache_strategy = next_opt.cache_strategy;
+		if (sync_present)
+			sbi->sync_decompress = next_sync;
+		if (priority_present) {
+			sbi->opt.worker_queue_priority =
+			    next_opt.worker_queue_priority;
+			sbi->decompress_queue_priority =
+			    next_opt.worker_queue_priority;
+		}
+		mtx_unlock(&sbi->control_lock);
+		erofs_set_xattr_state(sbi, xattr_user_enabled);
+		erofs_set_acl_state(sbi, acl_enabled);
+		if (directio_present) {
+			if (directio_enabled)
+				set_opt(&sbi->opt, DIRECT_IO);
+			else
+				clear_opt(&sbi->opt, DIRECT_IO);
+		}
+		return (0);
+	update_fail:
+		return (error);
+	}
+	args = NULL;
+	arg_count = 0;
+	error = erofs_parse_device_options(mp, &args, &arg_count);
+	if (error != 0)
+		return (error);
+	if (vfs_filteropt(mp->mnt_optnew, erofs_opts) != 0) {
+		error = EINVAL;
+		goto out_args;
+	}
+	error = erofs_parse_fsoffset(mp, &fsoffset, &fsoffset_present);
+	if (error != 0)
+		goto out_args;
+	error = erofs_parse_directio_options(mp, &directio_enabled,
+	    &directio_present);
+	if (error != 0)
+		goto out_args;
+	error = erofs_parse_xattr_options(mp, true, &xattr_user_enabled);
+	if (error != 0)
+		goto out_args;
+	error = erofs_parse_acl_options(mp, true, &acl_enabled);
+	if (error != 0)
+		goto out_args;
+	fspec = NULL;
+	error = vfs_getopt(mp->mnt_optnew, "from", (void **)&fspec, &len);
+	if (error != 0 || fspec == NULL || len == 0 || fspec[len - 1] != '\0') {
+		error = EINVAL;
+		goto out_args;
+	}
+	mp->mnt_iosize_max = MAXPHYS;
+	error = erofs_open_device(mp, NULL, fspec, &primary);
+	if (error != 0)
+		goto out_args;
+	primary.fsoff = fsoffset;
+	erofs_update_iosize_max(mp, &primary);
+	error = erofs_mountfs(&primary, mp, args, arg_count, xattr_user_enabled,
+	    acl_enabled, directio_enabled);
+	if (error != 0)
+		erofs_release_device_info(&primary);
+out_args:
+	erofs_free_device_args(args, arg_count);
+	if (error != 0)
+		return (error);
+	vfs_mountedfrom(mp, fspec);
+	return (erofs_statfs(mp, &mp->mnt_stat));
+}
+
+static int
+erofs_statfs(struct mount *mp, struct statfs *sbp)
+{
+	struct erofs_sb_info *sbi;
+
+	sbi = MTOE(mp);
+	sbp->f_bsize = sbi->block_size;
+	sbp->f_iosize = sbi->block_size;
+	sbp->f_blocks = sbi->total_blocks;
+	sbp->f_bfree = 0;
+	sbp->f_bavail = 0;
+	sbp->f_files = INT64_MAX;
+	sbp->f_ffree = sbi->inos <= (uint64_t)INT64_MAX ?
+	    INT64_MAX - (int64_t)sbi->inos :
+	    0;
+	return (0);
 }
