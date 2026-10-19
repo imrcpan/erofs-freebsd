@@ -395,6 +395,7 @@ struct erofs_sb_info {
 	uint16_t extra_devices;
 	uint16_t device_id_mask;
 	bool flatdev;
+	erofs_blk_t total_blocks;
 	erofs_blk_t flatdev_blocks;
 	struct erofs_device_info *devs;
 	struct mtx z_extent_cache_lock;

@@ -605,6 +605,70 @@ erofs_free_dev_context(struct erofs_sb_info *sbi)
 	}
 }
 
+static void
+erofs_sb_blocks_root(const struct erofs_super_block *dsb, uint32_t incompat,
+    uint64_t *blocks, erofs_nid_t *root_nid)
+{
+	*blocks = le32toh(dsb->blocks_lo);
+	if ((incompat & EROFS_FEATURE_INCOMPAT_48BIT) != 0 &&
+	    dsb->rootnid_8b != 0) {
+		*blocks |= (uint64_t)le16toh(dsb->rb.blocks_hi) << 32;
+		*root_nid = le64toh(dsb->rootnid_8b);
+	} else {
+		*root_nid = le16toh(dsb->rb.rootnid_2b);
+	}
+}
+
+static int
+erofs_validate_device_size(struct erofs_sb_info *sbi,
+    struct erofs_device_info *dif, erofs_blk_t blocks)
+{
+	uint64_t bytes, end;
+
+	/*
+	 * The sector size is a power of two, so a block that is not smaller
+	 * is a multiple of it.
+	 */
+	if (sbi->block_size < dif->sectorsize)
+		return (EINVAL);
+	bytes = blocks << sbi->blkszbits;
+	if (__builtin_add_overflow(dif->fsoff, bytes, &end))
+		return (EOVERFLOW);
+	if (end > dif->mediasize)
+		return (ENXIO);
+	return (0);
+}
+
+static int
+erofs_init_device(struct erofs_sb_info *sbi, struct erofs_device_info *dif,
+    const char *path)
+{
+	struct erofs_device_info opened;
+	erofs_blk_t blocks, uniaddr;
+	int error;
+
+	blocks = dif->blocks;
+	uniaddr = dif->uniaddr;
+	error = erofs_open_device(sbi->mnt, sbi, path, &opened);
+	if (error != 0)
+		return (error);
+	erofs_update_iosize_max(sbi->mnt, &opened);
+	opened.blocks = blocks;
+	opened.uniaddr = uniaddr;
+	error = erofs_validate_device_size(sbi, &opened, opened.blocks);
+	if (error != 0) {
+		erofs_release_device_info(&opened);
+		return (error);
+	}
+	error = erofs_register_source_upper(sbi, &opened);
+	if (error != 0) {
+		erofs_release_device_info(&opened);
+		return (error);
+	}
+	*dif = opened;
+	return (0);
+}
+
 static const char *
 erofs_device_arg_path(const struct erofs_device_arg *args, unsigned int count,
     unsigned int slot)
@@ -616,4 +680,119 @@ erofs_device_arg_path(const struct erofs_device_arg *args, unsigned int count,
 			return (args[i].path);
 	}
 	return (NULL);
+}
+
+static int
+erofs_scan_devices(struct erofs_sb_info *sbi,
+    const struct erofs_super_block *dsb, const struct erofs_device_arg *args,
+    unsigned int arg_count)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	struct erofs_deviceslot *slots;
+	struct erofs_device_info *dif;
+	const char *path;
+	erofs_off_t devt_off;
+	uint64_t devt_size, image_size, end;
+	erofs_blk_t maxend;
+	unsigned int i, mask;
+	int err;
+
+	sbi->total_blocks = sbi->dif0.blocks;
+	sbi->flatdev_blocks = sbi->dif0.blocks;
+	if (sbi->extra_devices == 0) {
+		if (arg_count != 0) {
+			vfs_mount_error(sbi->mnt,
+			    "erofs: external devices given without a device "
+			    "table");
+			return (EINVAL);
+		}
+		return (0);
+	}
+	devt_off = (uint64_t)le16toh(dsb->devt_slotoff) * EROFS_DEVT_SLOT_SIZE;
+	devt_size = (uint64_t)sbi->extra_devices * EROFS_DEVT_SLOT_SIZE;
+	if (sbi->dif0.blocks > (UINT64_MAX >> sbi->blkszbits)) {
+		vfs_mount_error(sbi->mnt, "erofs: image size overflows");
+		return (EINTEGRITY);
+	}
+	image_size = sbi->dif0.blocks << sbi->blkszbits;
+	if (devt_off > image_size || devt_size > image_size - devt_off) {
+		vfs_mount_error(sbi->mnt,
+		    "erofs: device table of %ju bytes at %ju is outside the "
+		    "image",
+		    (uintmax_t)devt_size, (uintmax_t)devt_off);
+		return (EINTEGRITY);
+	}
+	err = erofs_read_metadata_range(sbi, 0, devt_off, (size_t)devt_size,
+	    &buf);
+	if (err != 0)
+		return (err);
+	slots = buf.data;
+	sbi->devs = mallocarray(sbi->extra_devices, sizeof(*sbi->devs), M_EROFS,
+	    M_WAITOK | M_ZERO);
+	maxend = sbi->dif0.blocks;
+	for (i = 0; i < sbi->extra_devices; ++i) {
+		dif = &sbi->devs[i];
+		dif->blocks = le32toh(slots[i].blocks_lo);
+		dif->uniaddr = le32toh(slots[i].uniaddr_lo);
+		if (erofs_sb_has_48bit(sbi)) {
+			dif->blocks |= (uint64_t)le16toh(slots[i].blocks_hi)
+			    << 32;
+			dif->uniaddr |= (uint64_t)le16toh(slots[i].uniaddr_hi)
+			    << 32;
+		}
+		/*
+		 * blocks == 0 is valid: mkfs.erofs --blobdev leaves such an
+		 * empty device.
+		 */
+		if (__builtin_add_overflow(dif->uniaddr, dif->blocks, &end)) {
+			vfs_mount_error(sbi->mnt,
+			    "erofs: device %u: unified address plus size "
+			    "overflows",
+			    i + 1);
+			err = EINTEGRITY;
+			goto out;
+		}
+		if (__builtin_add_overflow(sbi->total_blocks, dif->blocks,
+			&sbi->total_blocks)) {
+			err = EOVERFLOW;
+			goto out;
+		}
+		maxend = MAX(maxend, (erofs_blk_t)end);
+	}
+	erofs_put_metabuf(&buf);
+	sbi->flatdev_blocks = maxend;
+	mask = 1;
+	while (mask < (unsigned int)sbi->extra_devices + 1)
+		mask <<= 1;
+	sbi->device_id_mask = mask - 1;
+	sbi->flatdev = arg_count == 0;
+	if (sbi->flatdev) {
+		/*
+		 * A split image mounted without device options still mounts;
+		 * reads beyond the provider fail with ENXIO.
+		 */
+		return (0);
+	}
+	if (arg_count != sbi->extra_devices) {
+		vfs_mount_error(sbi->mnt,
+		    "erofs: external devices don't match (ondisk %u, given %u)",
+		    sbi->extra_devices, arg_count);
+		return (arg_count < sbi->extra_devices ? ENXIO : EINVAL);
+	}
+	for (i = 0; i < arg_count; ++i) {
+		if (args[i].slot == 0 || args[i].slot > sbi->extra_devices)
+			return (EINVAL);
+	}
+	for (i = 0; i < sbi->extra_devices; ++i) {
+		path = erofs_device_arg_path(args, arg_count, i + 1);
+		if (path == NULL)
+			return (ENXIO);
+		err = erofs_init_device(sbi, &sbi->devs[i], path);
+		if (err != 0)
+			return (err);
+	}
+	return (0);
+out:
+	erofs_put_metabuf(&buf);
+	return (err);
 }
