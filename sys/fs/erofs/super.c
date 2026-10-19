@@ -95,6 +95,168 @@ erofs_log_corrupt(const struct erofs_sb_info *sbi, uint64_t nid,
 	return (EINTEGRITY);
 }
 
+#define EROFS_DEVICE_OPT_PREFIX "device."
+
+struct erofs_device_arg {
+	uint16_t slot;
+	char *path;
+};
+
+static void
+erofs_free_device_args(struct erofs_device_arg *args, unsigned int count)
+{
+	unsigned int i;
+
+	if (args == NULL)
+		return;
+	for (i = 0; i < count; ++i)
+		free(args[i].path, M_EROFS);
+	free(args, M_EROFS);
+}
+
+static int
+erofs_parse_device_slot(const char *name, uint16_t *slotp)
+{
+	const char *p;
+	unsigned int slot;
+
+	if (strncmp(name, EROFS_DEVICE_OPT_PREFIX,
+		sizeof(EROFS_DEVICE_OPT_PREFIX) - 1) != 0)
+		return (ENOENT);
+	p = name + sizeof(EROFS_DEVICE_OPT_PREFIX) - 1;
+	if (*p < '1' || *p > '9')
+		return (EINVAL);
+	slot = 0;
+	for (; *p != '\0'; ++p) {
+		if (*p < '0' || *p > '9' ||
+		    slot > (unsigned int)(UINT16_MAX - (*p - '0')) / 10)
+			return (EINVAL);
+		slot = slot * 10 + (*p - '0');
+	}
+	*slotp = slot;
+	return (0);
+}
+
+static int
+erofs_parse_device_options(struct mount *mp, struct erofs_device_arg **argsp,
+    unsigned int *countp)
+{
+	struct erofs_device_arg *args;
+	struct vfsopt *opt;
+	char name[32];
+	unsigned int count, device_count, slot_count, i;
+	uint16_t slot;
+	int error;
+
+	*argsp = NULL;
+	*countp = 0;
+	count = 0;
+	device_count = 0;
+	slot_count = 0;
+	TAILQ_FOREACH(opt, mp->mnt_optnew, link) {
+		if (strcmp(opt->name, "device") == 0) {
+			if (opt->value == NULL || opt->len == 0 ||
+			    ((char *)opt->value)[opt->len - 1] != '\0') {
+				vfs_mount_error(mp,
+				    "erofs: invalid external device option %s",
+				    opt->name);
+				return (EINVAL);
+			}
+			if (device_count == UINT16_MAX)
+				return (E2BIG);
+			++device_count;
+			continue;
+		}
+		error = erofs_parse_device_slot(opt->name, &slot);
+		if (error == ENOENT)
+			continue;
+		if (error != 0 || opt->value == NULL || opt->len <= 1 ||
+		    ((char *)opt->value)[opt->len - 1] != '\0') {
+			vfs_mount_error(mp,
+			    "erofs: invalid external device option %s",
+			    opt->name);
+			return (EINVAL);
+		}
+		if (slot_count == UINT16_MAX)
+			return (E2BIG);
+		++slot_count;
+	}
+	if (device_count != 0 && slot_count != 0) {
+		vfs_mount_error(mp,
+		    "erofs: device and device.N options cannot be combined");
+		return (EINVAL);
+	}
+	count = device_count != 0 ? device_count : slot_count;
+	if (count == 0)
+		return (0);
+
+	args = mallocarray(count, sizeof(*args), M_EROFS, M_WAITOK | M_ZERO);
+	if (device_count != 0) {
+		i = 0;
+		TAILQ_FOREACH(opt, mp->mnt_optnew, link) {
+			if (strcmp(opt->name, "device") != 0)
+				continue;
+			args[i].slot = i + 1;
+			args[i].path = malloc(opt->len, M_EROFS, M_WAITOK);
+			memcpy(args[i].path, opt->value, opt->len);
+			++i;
+		}
+		vfs_deleteopt(mp->mnt_optnew, "device");
+	} else {
+		i = 0;
+		TAILQ_FOREACH(opt, mp->mnt_optnew, link) {
+			error = erofs_parse_device_slot(opt->name, &slot);
+			if (error == ENOENT)
+				continue;
+			KASSERT(error == 0,
+			    ("validated EROFS device option changed"));
+			args[i].slot = slot;
+			args[i].path = malloc(opt->len, M_EROFS, M_WAITOK);
+			memcpy(args[i].path, opt->value, opt->len);
+			++i;
+		}
+		for (i = 0; i < count; ++i) {
+			unsigned int j;
+
+			for (j = 0; j < i; ++j) {
+				if (args[i].slot != args[j].slot)
+					continue;
+				vfs_mount_error(mp,
+				    "erofs: external device slot %u was "
+				    "specified more than once",
+				    args[i].slot);
+				erofs_free_device_args(args, count);
+				return (EINVAL);
+			}
+		}
+		for (i = 0; i < count; ++i) {
+			snprintf(name, sizeof(name),
+			    EROFS_DEVICE_OPT_PREFIX "%u", args[i].slot);
+			vfs_deleteopt(mp->mnt_optnew, name);
+		}
+	}
+	*argsp = args;
+	*countp = count;
+	return (0);
+}
+
+static int
+erofs_reject_device_update(struct mount *mp)
+{
+	struct vfsopt *opt;
+
+	TAILQ_FOREACH(opt, mp->mnt_optnew, link) {
+		if (strcmp(opt->name, "device") != 0 &&
+		    strncmp(opt->name, EROFS_DEVICE_OPT_PREFIX,
+			sizeof(EROFS_DEVICE_OPT_PREFIX) - 1) != 0)
+			continue;
+		vfs_mount_error(mp,
+		    "erofs: external devices cannot be changed on update");
+		return (EOPNOTSUPP);
+	}
+	return (0);
+}
+
 struct erofs_device_handle {
 	struct vnode *devvp;  /* block: private mntfs vnode; file: the file */
 	struct vnode *odevvp; /* block: the devfs vnode, reference only */
@@ -441,4 +603,17 @@ erofs_free_dev_context(struct erofs_sb_info *sbi)
 			erofs_release_device_info(&sbi->devs[i - 1]);
 		free(sbi->devs, M_EROFS);
 	}
+}
+
+static const char *
+erofs_device_arg_path(const struct erofs_device_arg *args, unsigned int count,
+    unsigned int slot)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; ++i) {
+		if (args[i].slot == slot)
+			return (args[i].path);
+	}
+	return (NULL);
 }
