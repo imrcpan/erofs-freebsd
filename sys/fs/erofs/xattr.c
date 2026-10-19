@@ -24,6 +24,16 @@
 #define EROFS_XATTR_CACHE_BODY_LIMIT   (64UL * 1024)
 #define EROFS_XATTR_CACHE_MOUNT_BUDGET (1024UL * 1024)
 
+struct erofs_xattr_iter {
+	struct erofs_sb_info *sbi;
+	struct erofs_inode *vi;
+	int attrnamespace;
+	const char *name;
+	size_t name_len;
+	struct uio *uio;
+	size_t *sizep;
+};
+
 static int erofs_xattr_load_body(struct erofs_sb_info *sbi,
     struct erofs_inode *vi, struct erofs_buf *bodybuf,
     struct erofs_xattr_ibody_header **ihp, size_t *header_sizep);
@@ -290,6 +300,26 @@ fail:
 	return (error);
 }
 
+static int
+erofs_xattr_validate_entry(struct erofs_xattr_entry *entry, size_t remaining,
+    size_t *entry_sizep, size_t *value_sizep)
+{
+	size_t entry_size, value_size;
+
+	if (remaining < sizeof(*entry))
+		return (EINTEGRITY);
+	value_size = le16toh(entry->e_value_size);
+	/* The aligned size covers the header, the name and the value. */
+	entry_size = erofs_xattr_entry_size(entry);
+	if (entry_size > remaining)
+		return (EINTEGRITY);
+	if (entry_sizep != NULL)
+		*entry_sizep = entry_size;
+	if (value_sizep != NULL)
+		*value_sizep = value_size;
+	return (0);
+}
+
 static bool
 erofs_xattr_prefix(uint8_t base_index, int *namespacep, const char **prefixp,
     size_t *prefix_lenp)
@@ -420,6 +450,179 @@ erofs_xattr_name_match(const char *namespace_prefix,
 		return (false);
 	return (memcmp(name + namespace_prefix_len + infix_len, entry->e_name,
 		    entry->e_name_len) == 0);
+}
+
+static erofs_off_t
+erofs_xattr_shared_entry_offset(const struct erofs_sb_info *sbi,
+    uint32_t shared_id)
+{
+	/* A 32-bit block address and a 16-bit shift: below 2^48. */
+	return (((erofs_off_t)sbi->xattr_blkaddr << sbi->blkszbits) +
+	    (erofs_off_t)shared_id * sizeof(uint32_t));
+}
+
+static int
+erofs_xattr_load_shared_entry(struct erofs_sb_info *sbi, uint32_t shared_id,
+    struct erofs_buf *entrybuf, size_t *value_sizep)
+{
+	struct erofs_buf hdrbuf = EROFS_BUF_INITIALIZER;
+	struct erofs_xattr_entry *entry;
+	struct erofs_inode *backing_en;
+	erofs_off_t off;
+	size_t entry_size, value_size;
+	int error;
+
+	backing_en = erofs_sb_has_shared_ea_in_metabox(sbi) ? sbi->metabox_en :
+							      NULL;
+	if (erofs_sb_has_shared_ea_in_metabox(sbi) && backing_en == NULL)
+		return (erofs_corrupt(sbi, EROFS_NID_NONE,
+		    "shared xattrs are in the metabox, but the image has "
+		    "none"));
+
+	off = erofs_xattr_shared_entry_offset(sbi, shared_id);
+	error = erofs_xattr_read_backing(sbi, backing_en, off, sizeof(*entry),
+	    &hdrbuf);
+	if (error != 0)
+		return (error);
+	entry = hdrbuf.data;
+	value_size = le16toh(entry->e_value_size);
+	entry_size = erofs_xattr_entry_size(entry);
+
+	erofs_put_metabuf(&hdrbuf);
+
+	/*
+	 * The entry is read whole, so the name and the value are inside it by
+	 * construction (entry_size covers both).
+	 */
+	error = erofs_xattr_read_backing(sbi, backing_en, off, entry_size,
+	    entrybuf);
+	if (error != 0)
+		return (error);
+	if (value_sizep != NULL)
+		*value_sizep = value_size;
+	return (0);
+}
+
+static int
+erofs_listxattr_foreach(struct erofs_xattr_iter *it,
+    struct erofs_xattr_entry *entry)
+{
+	const char *infix, *namespace_prefix;
+	size_t infix_len, namespace_prefix_len;
+	uint8_t base_index;
+	int err;
+
+	err = erofs_xattr_resolve_name(it->sbi, entry, &base_index, &infix,
+	    &infix_len);
+	if (err == ENOATTR)
+		return (0);
+	if (err != 0)
+		return (err);
+	err = erofs_xattr_namespace_prefix(it->attrnamespace, base_index,
+	    &namespace_prefix, &namespace_prefix_len);
+	if (err == ENOATTR)
+		return (0);
+	if (err != 0)
+		return (err);
+	err = erofs_xattr_list_move(namespace_prefix, namespace_prefix_len,
+	    infix, infix_len, entry->e_name, entry->e_name_len, it->uio,
+	    it->sizep);
+	if (err == EINTEGRITY)
+		return (erofs_corrupt(it->sbi, it->vi->nid,
+		    "xattr name is longer than %d bytes", EROFS_NAME_LEN));
+	return (err);
+}
+
+static int
+erofs_getxattr_foreach(struct erofs_xattr_iter *it,
+    struct erofs_xattr_entry *entry, size_t value_size)
+{
+	const char *infix, *namespace_prefix;
+	size_t infix_len, namespace_prefix_len;
+	uint8_t base_index;
+	int error;
+
+	error = erofs_xattr_resolve_name(it->sbi, entry, &base_index, &infix,
+	    &infix_len);
+	if (error != 0)
+		return (error);
+	error = erofs_xattr_namespace_prefix(it->attrnamespace, base_index,
+	    &namespace_prefix, &namespace_prefix_len);
+	if (error != 0)
+		return (error);
+	if (!erofs_xattr_name_match(namespace_prefix, namespace_prefix_len,
+		infix, infix_len, entry, it->name, it->name_len))
+		return (ENOATTR);
+	return (erofs_xattr_move(entry->e_name + entry->e_name_len, value_size,
+	    it->uio, it->sizep));
+}
+
+static int
+erofs_xattr_iter_inline(struct erofs_xattr_iter *it, char *body,
+    size_t header_size, bool get)
+{
+	struct erofs_xattr_entry *entry;
+	char *cursor;
+	size_t entry_size, remaining, value_size;
+	int ret;
+
+	remaining = it->vi->xattr_isize - header_size;
+	cursor = body + header_size;
+	while (remaining != 0) {
+		entry = (struct erofs_xattr_entry *)cursor;
+		ret = erofs_xattr_validate_entry(entry, remaining, &entry_size,
+		    get ? &value_size : NULL);
+		if (ret != 0)
+			return (erofs_corrupt(it->sbi, it->vi->nid,
+			    "invalid xattr entry at offset %zu of the xattr "
+			    "area",
+			    (size_t)(cursor - body)));
+		if (get)
+			ret = erofs_getxattr_foreach(it, entry, value_size);
+		else
+			ret = erofs_listxattr_foreach(it, entry);
+		if (get) {
+			if (ret != ENOATTR)
+				return (ret);
+		} else if (ret != 0) {
+			return (ret);
+		}
+		cursor += entry_size;
+		remaining -= entry_size;
+	}
+	return (get ? ENOATTR : 0);
+}
+
+static int
+erofs_xattr_iter_shared(struct erofs_xattr_iter *it,
+    struct erofs_xattr_ibody_header *ih, bool get)
+{
+	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
+	struct erofs_xattr_entry *entry;
+	uint32_t shared_id;
+	size_t value_size;
+	int ret;
+
+	for (uint8_t i = 0; i < ih->h_shared_count; i++) {
+		shared_id = le32toh(ih->h_shared_xattrs[i]);
+		ret = erofs_xattr_load_shared_entry(it->sbi, shared_id, &buf,
+		    get ? &value_size : NULL);
+		if (ret != 0)
+			return (ret);
+		entry = buf.data;
+		if (get)
+			ret = erofs_getxattr_foreach(it, entry, value_size);
+		else
+			ret = erofs_listxattr_foreach(it, entry);
+		erofs_put_metabuf(&buf);
+		if (get) {
+			if (ret != ENOATTR)
+				return (ret);
+		} else if (ret != 0) {
+			return (ret);
+		}
+	}
+	return (get ? ENOATTR : 0);
 }
 
 static bool
