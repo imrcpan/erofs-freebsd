@@ -830,6 +830,36 @@ erofs_free_dev_context(struct erofs_sb_info *sbi)
 }
 
 static void
+erofs_drop_internal_inodes(struct erofs_sb_info *sbi)
+{
+	if (sbi->metabox_en != NULL)
+		free(sbi->metabox_en, M_EROFS);
+	if (sbi->packed_inode != NULL)
+		free(sbi->packed_inode, M_EROFS);
+}
+
+static int
+erofs_sb_free(struct erofs_sb_info *sbi)
+{
+	int error;
+
+	if (sbi == NULL)
+		return (0);
+	error = erofs_unregister_sysfs(sbi);
+	if (error != 0)
+		return (error);
+	z_erofs_extent_cache_fini(sbi);
+	z_erofs_stream_pool_fini(sbi);
+	erofs_xattr_prefixes_cleanup(sbi);
+	erofs_drop_internal_inodes(sbi);
+	erofs_free_dev_context(sbi);
+	erofs_release_device_info(&sbi->dif0);
+	erofs_management_fini(sbi);
+	free(sbi, M_EROFS);
+	return (0);
+}
+
+static void
 erofs_sb_blocks_root(const struct erofs_super_block *dsb, uint32_t incompat,
     uint64_t *blocks, erofs_nid_t *root_nid)
 {
