@@ -35,11 +35,9 @@
 #define EROFS_FEATURE_INCOMPAT_XATTR_PREFIXES 0x00000040
 #define EROFS_FEATURE_INCOMPAT_48BIT	      0x00000080
 #define EROFS_FEATURE_INCOMPAT_METABOX	      0x00000100
-/* clang-format off */
-#define EROFS_ALL_FEATURE_INCOMPAT ((EROFS_FEATURE_INCOMPAT_METABOX << 1) - 1)
-/* clang-format on */
+#define EROFS_ALL_FEATURE_INCOMPAT	      ((EROFS_FEATURE_INCOMPAT_METABOX << 1) - 1)
 
-#define EROFS_SB_EXTSLOT_SIZE 16
+#define EROFS_SB_EXTSLOT_SIZE		      16
 
 struct erofs_deviceslot {
 	uint8_t tag[64];     /* digest(sha256), etc. */
