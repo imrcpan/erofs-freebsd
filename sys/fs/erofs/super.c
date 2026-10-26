@@ -658,7 +658,8 @@ erofs_destroy_device_handle(struct erofs_device_handle *handle)
 		}
 		vrele(handle->odevvp);
 	} else if (handle->devvp != NULL) {
-		vrele(handle->devvp);
+		(void)vn_close(handle->devvp, FREAD, curthread->td_ucred,
+		    curthread);
 	}
 	if (handle->dev != NULL)
 		dev_rel(handle->dev);
@@ -726,12 +727,18 @@ erofs_open_device(struct mount *mp, struct erofs_sb_info *sbi, const char *path,
 	if (devvp->v_type == VREG) {
 		struct vattr va;
 
-		error = VOP_ACCESS(devvp, VREAD, curthread->td_ucred,
-		    curthread);
-		if (error == 0)
-			error = VOP_GETATTR(devvp, &va, curthread->td_ucred);
+		error = vn_open_vnode(devvp, FREAD, curthread->td_ucred,
+		    curthread, NULL);
 		if (error != 0) {
 			vput(devvp);
+			free(handle, M_EROFS);
+			return (error);
+		}
+		error = VOP_GETATTR(devvp, &va, curthread->td_ucred);
+		if (error != 0) {
+			VOP_UNLOCK(devvp);
+			(void)vn_close(devvp, FREAD, curthread->td_ucred,
+			    curthread);
 			free(handle, M_EROFS);
 			return (error);
 		}
