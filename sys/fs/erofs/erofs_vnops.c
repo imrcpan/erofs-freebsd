@@ -33,6 +33,7 @@ static vop_readlink_t erofs_readlink;
 
 static vop_open_t erofs_open;
 static vop_read_t erofs_read;
+static vop_getpages_t erofs_getpages;
 static vop_bmap_t erofs_bmap;
 static vop_ioctl_t erofs_ioctl;
 
@@ -312,6 +313,18 @@ erofs_read(struct vop_read_args *ap)
 	default:
 		return (EINVAL);
 	}
+}
+
+static int
+erofs_getpages(struct vop_getpages_args *ap)
+{
+	struct vnode *vp;
+
+	vp = ap->a_vp;
+	if (erofs_inode_is_data_compressed(VTOE(vp)->datalayout))
+		return (z_erofs_getpages(vp, ap->a_m, ap->a_count,
+		    ap->a_rbehind, ap->a_rahead));
+	return (vnode_pager_local_getpages(ap));
 }
 
 static int
@@ -607,7 +620,7 @@ struct vop_vector erofs_vnodeops = {
 	.vop_read = erofs_read,
 	.vop_bmap = erofs_bmap,
 	.vop_ioctl = erofs_ioctl,
-	.vop_getpages = vnode_pager_local_getpages,
+	.vop_getpages = erofs_getpages,
 
 	.vop_getattr = erofs_getattr,
 	.vop_setattr = erofs_setattr,

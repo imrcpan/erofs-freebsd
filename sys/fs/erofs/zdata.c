@@ -11,10 +11,19 @@
 #include <sys/kernel.h>
 #include <sys/libkern.h>
 #include <sys/malloc.h>
+#include <sys/rwlock.h>
+#include <sys/sf_buf.h>
 #include <sys/smp.h>
 #include <sys/uio.h>
+#include <sys/vmmeter.h>
+
+#include <vm/vm.h>
+#include <vm/vm_object.h>
+#include <vm/vm_page.h>
+#include <vm/vm_pager.h>
 
 #include <fs/erofs/compress.h>
+#include <fs/erofs/trace.h>
 
 enum z_erofs_cache_lookup {
 	Z_EROFS_CACHE_BYPASS,
@@ -818,11 +827,46 @@ z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
 }
 
 static int
+z_erofs_map_pos(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t pos, struct erofs_map_blocks *map)
+{
+	int error;
+
+	*map = (struct erofs_map_blocks) { .m_la = pos };
+	error = erofs_map_blocks(sbi, vi, map);
+	if (error != 0)
+		return (error);
+	if (map->m_llen == 0 || map->m_la > pos ||
+	    pos - map->m_la >= map->m_llen)
+		return (EINTEGRITY);
+	return (0);
+}
+
+static int
+z_erofs_read_fragment(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t mapoff, size_t len, void *out)
+{
+	void *fragment;
+	int error;
+
+	if (sbi->packed_inode == NULL || sbi->packed_inode->nid == vi->nid ||
+	    vi->z_fragmentoff > UINT64_MAX - mapoff)
+		return (EINTEGRITY);
+	error = erofs_read_data(sbi, sbi->packed_inode,
+	    vi->z_fragmentoff + mapoff, len, &fragment);
+	if (error != 0)
+		return (error);
+	memcpy(out, fragment, len);
+	erofs_brelse(fragment);
+	return (0);
+}
+
+static int
 z_erofs_do_read(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     erofs_off_t loff, size_t len, char *out)
 {
 	struct erofs_map_blocks map;
-	void *decoded, *fragment;
+	void *decoded;
 	erofs_off_t mapoff;
 	size_t decoded_len, done, want;
 	bool cache_eligible, partial;
@@ -831,27 +875,17 @@ z_erofs_do_read(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 
 	done = 0;
 	while (done < len) {
-		map = (struct erofs_map_blocks) { .m_la = loff + done };
-		error = erofs_map_blocks(sbi, vi, &map);
+		error = z_erofs_map_pos(sbi, vi, loff + done, &map);
 		if (error != 0)
 			return (error);
-		if (map.m_llen == 0 || map.m_la > loff + done ||
-		    loff + done - map.m_la >= map.m_llen)
-			return (EINTEGRITY);
 		mapoff = loff + done - map.m_la;
 		want = MIN((size_t)(map.m_llen - mapoff), len - done);
 
 		if ((map.m_flags & EROFS_MAP_FRAGMENT) != 0) {
-			if (sbi->packed_inode == NULL ||
-			    sbi->packed_inode->nid == vi->nid ||
-			    vi->z_fragmentoff > UINT64_MAX - mapoff)
-				return (EINTEGRITY);
-			error = erofs_read_data(sbi, sbi->packed_inode,
-			    vi->z_fragmentoff + mapoff, want, &fragment);
+			error = z_erofs_read_fragment(sbi, vi, mapoff, want,
+			    out + done);
 			if (error != 0)
 				return (error);
-			memcpy(out + done, fragment, want);
-			erofs_brelse(fragment);
 		} else if ((map.m_flags & EROFS_MAP_MAPPED) == 0) {
 			bzero(out + done, want);
 		} else {
@@ -934,6 +968,269 @@ z_erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 		if (error == 0)
 			error = uiomove(buf, want, uio);
 		free(buf, M_EROFS);
+		if (error != 0)
+			return (error);
+	}
+	return (0);
+}
+
+/* An extent can only be decoded as a whole. */
+struct z_erofs_decoded_extent {
+	struct erofs_map_blocks map;
+	/* NULL for a hole or a fragment. */
+	void *data;
+};
+
+static bool
+z_erofs_decoded_covers(const struct z_erofs_decoded_extent *ext,
+    erofs_off_t pos)
+{
+	return (ext->map.m_llen != 0 && pos >= ext->map.m_la &&
+	    pos - ext->map.m_la < ext->map.m_llen);
+}
+
+static int
+z_erofs_decoded_load(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    erofs_off_t pos, struct z_erofs_decoded_extent *ext)
+{
+	struct erofs_map_blocks *map;
+	int error;
+
+	free(ext->data, M_EROFS);
+	ext->data = NULL;
+	map = &ext->map;
+	error = z_erofs_map_pos(sbi, vi, pos, map);
+	if (error != 0)
+		return (error);
+	if ((map->m_flags & (EROFS_MAP_FRAGMENT | EROFS_MAP_MAPPED)) !=
+	    EROFS_MAP_MAPPED)
+		return (0);
+	return (z_erofs_decode_extent_dispatch(sbi, vi, map, map->m_llen,
+	    (map->m_flags & EROFS_MAP_PARTIAL_REF) != 0, &ext->data));
+}
+
+static int
+z_erofs_decoded_copy(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    const struct z_erofs_decoded_extent *ext, erofs_off_t pos, size_t len,
+    char *out)
+{
+	erofs_off_t mapoff;
+
+	mapoff = pos - ext->map.m_la;
+	if ((ext->map.m_flags & EROFS_MAP_FRAGMENT) != 0)
+		return (z_erofs_read_fragment(sbi, vi, mapoff, len, out));
+	if (ext->data == NULL)
+		bzero(out, len);
+	else
+		memcpy(out, (const char *)ext->data + mapoff, len);
+	return (0);
+}
+
+static int
+z_erofs_fill_page(struct erofs_sb_info *sbi, struct erofs_inode *vi,
+    vm_page_t m, struct z_erofs_decoded_extent *ext)
+{
+	struct sf_buf *sf;
+	erofs_off_t end, pos;
+	size_t done, len;
+	char *va;
+	int error;
+
+	pos = IDX_TO_OFF(m->pindex);
+	end = MIN(pos + PAGE_SIZE, vi->size);
+	sf = sf_buf_alloc(m, 0);
+	va = (char *)sf_buf_kva(sf);
+	error = 0;
+	for (done = 0; pos + done < end; done += len) {
+		if (!z_erofs_decoded_covers(ext, pos + done)) {
+			error = z_erofs_decoded_load(sbi, vi, pos + done, ext);
+			if (error != 0)
+				break;
+		}
+		len = MIN(end, ext->map.m_la + ext->map.m_llen) - (pos + done);
+		error = z_erofs_decoded_copy(sbi, vi, ext, pos + done, len,
+		    va + done);
+		if (error != 0)
+			break;
+	}
+	if (error == 0) {
+		bzero(va + done, PAGE_SIZE - done);
+		vm_page_valid(m);
+	}
+	sf_buf_free(sf);
+	return (error);
+}
+
+/* rbehind and rahead count contiguous pages, so the caller stops at a miss. */
+static bool
+z_erofs_fill_extra_page(vm_object_t obj, vm_pindex_t pindex,
+    const struct z_erofs_decoded_extent *ext, erofs_off_t size)
+{
+	struct sf_buf *sf;
+	erofs_off_t end, extent_end, pos;
+	vm_page_t m;
+	char *va;
+
+	pos = IDX_TO_OFF(pindex);
+	extent_end = ext->map.m_la + ext->map.m_llen;
+	end = MIN(pos + PAGE_SIZE, extent_end);
+	if (ext->data == NULL || pos < ext->map.m_la || pos >= end ||
+	    (end - pos < PAGE_SIZE && extent_end != size))
+		return (false);
+	m = vm_page_grab_unlocked(obj, pindex,
+	    VM_ALLOC_NORMAL | VM_ALLOC_NOWAIT);
+	if (m == NULL)
+		return (false);
+	if (!vm_page_none_valid(m)) {
+		vm_page_xunbusy(m);
+		return (true);
+	}
+	sf = sf_buf_alloc(m, 0);
+	va = (char *)sf_buf_kva(sf);
+	memcpy(va, (const char *)ext->data + (pos - ext->map.m_la), end - pos);
+	bzero(va + (end - pos), PAGE_SIZE - (end - pos));
+	sf_buf_free(sf);
+	vm_page_valid(m);
+	vm_page_readahead_finish(m);
+	return (true);
+}
+
+static int
+z_erofs_fill_behind(vm_object_t obj, vm_pindex_t first,
+    const struct z_erofs_decoded_extent *ext, erofs_off_t size)
+{
+	vm_pindex_t n;
+
+	for (n = 0; n < first; n++) {
+		if (!z_erofs_fill_extra_page(obj, first - 1 - n, ext, size))
+			break;
+	}
+	return (n);
+}
+
+static int
+z_erofs_fill_ahead(vm_object_t obj, vm_pindex_t last,
+    const struct z_erofs_decoded_extent *ext, erofs_off_t size)
+{
+	vm_pindex_t n;
+
+	for (n = 0; z_erofs_fill_extra_page(obj, last + 1 + n, ext, size); n++)
+		;
+	return (n);
+}
+
+int
+z_erofs_getpages(struct vnode *vp, vm_page_t *ma, int count, int *rbehind,
+    int *rahead)
+{
+	struct z_erofs_decoded_extent ext;
+	struct erofs_sb_info *sbi;
+	struct erofs_inode *vi;
+	vm_object_t obj;
+	int ahead, behind, error, i;
+
+	if (VN_IS_DOOMED(vp))
+		return (VM_PAGER_BAD);
+	sbi = MTOE(vp->v_mount);
+	vi = VTOE(vp);
+	obj = ma[0]->object;
+	KASSERT(IDX_TO_OFF(ma[0]->pindex) < vi->size,
+	    ("erofs: page %ju is beyond the size %ju of the file",
+		(uintmax_t)ma[0]->pindex, (uintmax_t)vi->size));
+	EROFS_TRACE_READ_FOLIO(vi, IDX_TO_OFF(ma[0]->pindex), ptoa(count),
+	    false);
+
+	bzero(&ext, sizeof(ext));
+	behind = 0;
+	ahead = 0;
+	error = z_erofs_decoded_load(sbi, vi, IDX_TO_OFF(ma[0]->pindex), &ext);
+	if (error == 0)
+		behind = z_erofs_fill_behind(obj, ma[0]->pindex, &ext,
+		    vi->size);
+	/* sendfile(2) passes the valid pages as bogus_page. */
+	for (i = 0; error == 0 && i < count; i++) {
+		if (ma[i] != bogus_page)
+			error = z_erofs_fill_page(sbi, vi, ma[i], &ext);
+	}
+	if (error == 0)
+		ahead = z_erofs_fill_ahead(obj, ma[count - 1]->pindex, &ext,
+		    vi->size);
+	free(ext.data, M_EROFS);
+	if (error != 0)
+		return (VM_PAGER_ERROR);
+
+	if (rbehind != NULL)
+		*rbehind = MIN(*rbehind, behind);
+	if (rahead != NULL)
+		*rahead = MIN(*rahead, ahead);
+	VM_CNT_INC(v_vnodein);
+	VM_CNT_ADD(v_vnodepgsin, count + behind + ahead);
+	return (VM_PAGER_OK);
+}
+
+static int
+z_erofs_read_zeroes(struct uio *uio, size_t len)
+{
+	size_t zlen;
+	int error;
+
+	while (len > 0) {
+		zlen = MIN(len, ZERO_REGION_SIZE);
+		error = uiomove(__DECONST(void *, zero_region), zlen, uio);
+		if (error != 0)
+			return (error);
+		len -= zlen;
+	}
+	return (0);
+}
+
+int
+z_erofs_read_pages(struct vnode *vp, struct uio *uio)
+{
+	struct erofs_map_blocks map;
+	struct erofs_sb_info *sbi;
+	struct erofs_inode *vi;
+	vm_object_t obj;
+	vm_page_t m;
+	erofs_off_t off;
+	size_t len, poff;
+	int error, rv;
+
+	sbi = MTOE(vp->v_mount);
+	vi = VTOE(vp);
+	obj = vp->v_object;
+	while (uio->uio_resid > 0 && (uint64_t)uio->uio_offset < vi->size) {
+		off = uio->uio_offset;
+		poff = off & PAGE_MASK;
+		len = MIN(MIN(PAGE_SIZE - poff, (size_t)uio->uio_resid),
+		    vi->size - off);
+		rv = vm_page_grab_valid_unlocked(&m, obj, OFF_TO_IDX(off),
+		    VM_ALLOC_NORMAL | VM_ALLOC_SBUSY | VM_ALLOC_IGN_SBUSY |
+			VM_ALLOC_NOCREAT);
+		if (rv != VM_PAGER_OK) {
+			/* Sparse files can be huge: do not cache the holes. */
+			error = z_erofs_map_pos(sbi, vi, off, &map);
+			if (error != 0)
+				return (error);
+			if ((map.m_flags &
+				(EROFS_MAP_FRAGMENT | EROFS_MAP_MAPPED)) == 0) {
+				error = z_erofs_read_zeroes(uio,
+				    MIN(map.m_la + map.m_llen - off,
+					(size_t)uio->uio_resid));
+				if (error != 0)
+					return (error);
+				continue;
+			}
+			rv = vm_page_grab_valid_unlocked(&m, obj,
+			    OFF_TO_IDX(off),
+			    VM_ALLOC_NORMAL | VM_ALLOC_SBUSY |
+				VM_ALLOC_IGN_SBUSY);
+			if (rv != VM_PAGER_OK)
+				return (EIO);
+		}
+		error = uiomove_fromphys(&m, poff, len, uio);
+		vm_page_activate(m);
+		vm_page_sunbusy(m);
 		if (error != 0)
 			return (error);
 	}

@@ -718,16 +718,19 @@ erofs_read_data_readahead(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 }
 
 static int
-erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
-    struct uio *uio)
+erofs_read_uio(struct vnode *vp, struct uio *uio)
 {
 	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
 	struct erofs_map_blocks map;
+	struct erofs_sb_info *sbi;
+	struct erofs_inode *vi;
 	void *blk;
 	erofs_off_t mapoff, physical;
 	size_t want, chunk;
 	int error;
 
+	sbi = MTOE(vp->v_mount);
+	vi = VTOE(vp);
 	if (uio->uio_offset < 0)
 		return (EINVAL);
 	if ((uint64_t)uio->uio_offset >= vi->size)
@@ -737,8 +740,11 @@ erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 	    !erofs_inode_is_data_compressed(vi->datalayout));
 
 	/* Compressed file path */
-	if (erofs_inode_is_data_compressed(vi->datalayout))
+	if (erofs_inode_is_data_compressed(vi->datalayout)) {
+		if (vp->v_type == VREG && vp->v_object != NULL)
+			return (z_erofs_read_pages(vp, uio));
 		return (z_erofs_read_uio(sbi, vi, uio));
+	}
 
 	/* Uncompressed file path */
 	while (uio->uio_resid > 0 && (uint64_t)uio->uio_offset < vi->size) {
@@ -800,7 +806,7 @@ erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 int
 erofs_read_file(struct vnode *vp, struct uio *uio)
 {
-	return (erofs_read_uio(MTOE(vp->v_mount), VTOE(vp), uio));
+	return (erofs_read_uio(vp, uio));
 }
 
 int
@@ -865,5 +871,5 @@ erofs_readlink_target(struct vnode *vp, struct uio *uio)
 	if (vi->size == 0)
 		return (
 		    erofs_corrupt(MTOE(vp->v_mount), vi->nid, "empty symlink"));
-	return (erofs_read_uio(MTOE(vp->v_mount), vi, uio));
+	return (erofs_read_uio(vp, uio));
 }

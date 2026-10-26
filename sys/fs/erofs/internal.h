@@ -663,6 +663,9 @@ int z_erofs_read_data(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     erofs_off_t loff, size_t len, void **bufp);
 int z_erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct uio *uio);
+int z_erofs_read_pages(struct vnode *vp, struct uio *uio);
+int z_erofs_getpages(struct vnode *vp, vm_page_t *ma, int count, int *rbehind,
+    int *rahead);
 int z_erofs_decompress(struct erofs_sb_info *sbi,
     const struct erofs_map_blocks *map, const void *src, size_t srclen,
     void *dst, size_t dstlen, bool partial);
