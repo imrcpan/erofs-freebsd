@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: MIT */
 /* Minimal DEFLATE decompressor for EROFS FreeBSD */
 
 #include <sys/param.h>

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: MIT */
 /* Contiguous-buffer LZ4 backend for EROFS FreeBSD. */
 
 #include <sys/param.h>

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MIT
 /* FreeBSD stream context pool and compression runtime accounting. */
 
 #include <sys/param.h>

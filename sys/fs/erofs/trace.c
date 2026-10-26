@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: MIT */
 
 #include <fs/erofs/internal.h>
 #include <fs/erofs/trace.h>

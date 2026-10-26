@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MIT
 /*
  * Copyright (C) 2019 HUAWEI, Inc.
  *             https://www.huawei.com/

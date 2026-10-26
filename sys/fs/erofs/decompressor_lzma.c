@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: MIT
 /*
  * EROFS MicroLZMA wrapper around FreeBSD's bundled XZ Embedded decoder.
  * The decoder source is compiled with private symbol names because the

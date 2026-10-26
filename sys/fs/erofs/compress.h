@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: MIT */
 
 #ifndef _FS_EROFS_COMPRESS_H_
 #define _FS_EROFS_COMPRESS_H_

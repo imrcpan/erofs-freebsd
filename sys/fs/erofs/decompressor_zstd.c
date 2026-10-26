@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: MIT */
 /* Minimal zstd decompressor for EROFS FreeBSD */
 #include "opt_zstdio.h"
 

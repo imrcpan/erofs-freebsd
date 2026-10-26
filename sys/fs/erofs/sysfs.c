@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: MIT */
 /* FreeBSD per-mount management controls for EROFS. */
 
 #include <sys/param.h>
