@@ -396,8 +396,9 @@ z_erofs_decode_worker_count(void)
 	return ((unsigned int)count);
 }
 
+/* Runs without the lock: decompress_taskqueue_creating excludes other users. */
 static void
-z_erofs_decode_taskqueue_init(struct erofs_sb_info *sbi __unused)
+z_erofs_decode_taskqueue_create(struct erofs_sb_info *sbi)
 {
 	unsigned int worker_count;
 
@@ -432,11 +433,29 @@ z_erofs_decode_taskqueue_acquire(struct erofs_sb_info *sbi)
 	struct taskqueue *taskqueue;
 
 	mtx_lock(&sbi->z_extent_cache_lock);
-	if (sbi->z_extent_cache.closing || sbi->decompress_taskqueue == NULL) {
+	while (sbi->decompress_taskqueue_creating)
+		cv_wait(&sbi->decompress_taskqueue_cv,
+		    &sbi->z_extent_cache_lock);
+	if (sbi->z_extent_cache.closing) {
 		taskqueue = NULL;
-	} else {
+	} else if (sbi->decompress_taskqueue != NULL ||
+	    sbi->decompress_taskqueue_tried) {
 		taskqueue = sbi->decompress_taskqueue;
+		if (taskqueue != NULL)
+			++sbi->decompress_taskqueue_users;
+	} else {
+		/* The user count keeps z_erofs_extent_cache_fini() waiting. */
+		sbi->decompress_taskqueue_tried = true;
+		sbi->decompress_taskqueue_creating = true;
 		++sbi->decompress_taskqueue_users;
+		mtx_unlock(&sbi->z_extent_cache_lock);
+		z_erofs_decode_taskqueue_create(sbi);
+		mtx_lock(&sbi->z_extent_cache_lock);
+		sbi->decompress_taskqueue_creating = false;
+		taskqueue = sbi->decompress_taskqueue;
+		if (taskqueue == NULL)
+			--sbi->decompress_taskqueue_users;
+		cv_broadcast(&sbi->decompress_taskqueue_cv);
 	}
 	mtx_unlock(&sbi->z_extent_cache_lock);
 	return (taskqueue);
@@ -465,7 +484,6 @@ z_erofs_extent_cache_init(struct erofs_sb_info *sbi)
 	cv_init(&sbi->decompress_taskqueue_cv, "erofs decode tq");
 	for (unsigned int i = 0; i < nitems(sbi->z_extent_cache.entries); ++i)
 		cv_init(&sbi->z_extent_cache.entries[i].cv, "erofs zextent");
-	z_erofs_decode_taskqueue_init(sbi);
 	sbi->z_extent_cache_initialized = true;
 	mtx_lock(&z_erofs_cache_list_lock);
 	LIST_INSERT_HEAD(&z_erofs_cache_mounts, sbi, z_extent_cache_link);
@@ -504,6 +522,10 @@ z_erofs_extent_cache_fini(struct erofs_sb_info *sbi)
 		cv_wait(&cache->entries[wait_index].cv,
 		    &sbi->z_extent_cache_lock);
 	}
+	/* A reader that is starting the threads holds a user reference. */
+	while (sbi->decompress_taskqueue_users != 0)
+		cv_wait(&sbi->decompress_taskqueue_cv,
+		    &sbi->z_extent_cache_lock);
 	/*
 	 * Workers read &sbi->decompress_taskqueue when they first run, possibly
 	 * after this point, so it is cleared only after taskqueue_free().
@@ -511,9 +533,6 @@ z_erofs_extent_cache_fini(struct erofs_sb_info *sbi)
 	taskqueue = sbi->decompress_taskqueue;
 	sbi->decompress_worker_count = 0;
 	sbi->decompress_worker_cpu_bound = false;
-	while (sbi->decompress_taskqueue_users != 0)
-		cv_wait(&sbi->decompress_taskqueue_cv,
-		    &sbi->z_extent_cache_lock);
 	mtx_unlock(&sbi->z_extent_cache_lock);
 	if (taskqueue != NULL) {
 		taskqueue_drain_all(taskqueue);

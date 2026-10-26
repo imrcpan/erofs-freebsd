@@ -410,6 +410,8 @@ struct erofs_sb_info {
 	struct taskqueue *decompress_taskqueue;
 	struct cv decompress_taskqueue_cv;
 	unsigned int decompress_taskqueue_users;
+	bool decompress_taskqueue_creating;
+	bool decompress_taskqueue_tried;
 	unsigned int decompress_worker_count;
 	bool decompress_worker_cpu_bound;
 	uint8_t decompress_queue_priority;
