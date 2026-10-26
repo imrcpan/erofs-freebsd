@@ -10,6 +10,7 @@ SRCS=	opt_ufs.h \
 	decompressor_deflate.c \
 	decompressor_lz4.c \
 	decompressor_lzma.c \
+	decompressor_zstd.c \
 	dir.c \
 	erofs_vnops.c \
 	erofs_zutil.c \
@@ -29,7 +30,6 @@ SRCS=	opt_ufs.h \
 CFLAGS+=	-DUFS_ACL -DZSTDIO
 .endif
 
-SRCS.ZSTDIO+=	decompressor_zstd.c
 CFLAGS.decompressor_zstd.c+=	-I${SRCTOP}/sys/contrib/zstd/lib/freebsd
 CFLAGS.decompressor_lzma.c+=	-DXZ_USE_CRC64 \
 	-I${SRCTOP}/sys/contrib/xz-embedded/freebsd \
