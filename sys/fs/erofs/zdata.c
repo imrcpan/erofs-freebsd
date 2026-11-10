@@ -10,6 +10,7 @@
 #include <sys/eventhandler.h>
 #include <sys/kernel.h>
 #include <sys/libkern.h>
+#include <sys/limits.h>
 #include <sys/malloc.h>
 #include <sys/rwlock.h>
 #include <sys/sf_buf.h>
@@ -690,11 +691,11 @@ z_erofs_decode_length(const struct erofs_map_blocks *map, erofs_off_t mapoff,
 
 int
 z_erofs_decode_extent(struct erofs_sb_info *sbi, struct erofs_inode *vi,
-    struct erofs_map_blocks *map, size_t decoded_len, bool partial, void **bufp)
+    struct erofs_map_blocks *map, size_t decoded_len, bool partial,
+    const void *input, void **bufp)
 {
 	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
-	const void *input;
-	void *compressed, *decoded;
+	void *decoded;
 	int error;
 
 	*bufp = NULL;
@@ -710,24 +711,26 @@ z_erofs_decode_extent(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 		(partial || decoded_len == map->m_llen),
 	    ("erofs: bad decoded length %zu", decoded_len));
 
-	if ((map->m_flags & EROFS_MAP_META) != 0) {
-		error = erofs_read_metadata_range(sbi, vi->nid, map->m_pa,
-		    (size_t)map->m_plen, &buf);
-	} else {
-		error = erofs_read_physical(sbi, map->m_deviceid, map->m_pa,
-		    (size_t)map->m_plen, &compressed);
+	KASSERT(input == NULL || (map->m_flags & EROFS_MAP_META) == 0,
+	    ("erofs: input for an inline extent"));
+	if (input == NULL) {
+		if ((map->m_flags & EROFS_MAP_META) != 0) {
+			error = erofs_read_metadata_range(sbi, vi->nid,
+			    map->m_pa, (size_t)map->m_plen, &buf);
+		} else {
+			error = erofs_read_physical(sbi, map->m_deviceid,
+			    map->m_pa, (size_t)map->m_plen, &buf.data);
+			buf.release = erofs_brelse;
+		}
+		if (error != 0)
+			return (error);
+		input = buf.data;
 	}
-	if (error != 0)
-		return (error);
-	input = (map->m_flags & EROFS_MAP_META) != 0 ? buf.data : compressed;
 
 	decoded = malloc(decoded_len, M_EROFS, M_WAITOK | M_ZERO);
 	error = z_erofs_decompress(sbi, map, input, (size_t)map->m_plen,
 	    decoded, decoded_len, partial);
-	if ((map->m_flags & EROFS_MAP_META) != 0)
-		erofs_put_metabuf(&buf);
-	else
-		erofs_brelse(compressed);
+	erofs_put_metabuf(&buf);
 	if (error != 0) {
 		free(decoded, M_EROFS);
 		return (error);
@@ -742,7 +745,7 @@ z_erofs_decode_task_run(void *context, int pending __unused)
 	struct erofs_decompress_task *task = context;
 
 	task->error = z_erofs_decode_extent(task->sbi, task->vi, &task->map,
-	    task->decoded_len, task->partial, &task->decoded);
+	    task->decoded_len, task->partial, task->input, &task->decoded);
 	mtx_lock(&task->lock);
 	atomic_add_64(&task->sbi->decompress_worker_runs, 1);
 	task->done = true;
@@ -764,7 +767,7 @@ z_erofs_decode_queue_priority(struct erofs_sb_info *sbi)
 int
 z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
     struct erofs_inode *vi, struct erofs_map_blocks *map, size_t decoded_len,
-    bool partial, void **bufp)
+    bool partial, const void *input, void **bufp)
 {
 	struct erofs_decompress_task *task;
 	struct taskqueue *taskqueue;
@@ -774,12 +777,12 @@ z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
 
 	if (sbi->sync_decompress != EROFS_SYNC_DECOMPRESS_FORCE_OFF)
 		return (z_erofs_decode_extent(sbi, vi, map, decoded_len,
-		    partial, bufp));
+		    partial, input, bufp));
 	taskqueue = z_erofs_decode_taskqueue_acquire(sbi);
 	if (taskqueue == NULL) {
 		atomic_add_64(&sbi->decompress_queue_fallbacks, 1);
 		return (z_erofs_decode_extent(sbi, vi, map, decoded_len,
-		    partial, bufp));
+		    partial, input, bufp));
 	}
 	/*
 	 * A decode worker can get here again: reading the inline input of a
@@ -791,7 +794,7 @@ z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
 		z_erofs_decode_taskqueue_release(sbi);
 		atomic_add_64(&sbi->decompress_queue_fallbacks, 1);
 		return (z_erofs_decode_extent(sbi, vi, map, decoded_len,
-		    partial, bufp));
+		    partial, input, bufp));
 	}
 	task = malloc(sizeof(*task), M_EROFS, M_WAITOK | M_ZERO);
 	task->sbi = sbi;
@@ -799,6 +802,7 @@ z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
 	task->map = *map;
 	task->decoded_len = decoded_len;
 	task->partial = partial;
+	task->input = input;
 	mtx_init(&task->lock, "erofs decomp task", NULL, MTX_DEF);
 	cv_init(&task->cv, "erofs decomp task");
 	queue_priority = z_erofs_decode_queue_priority(sbi);
@@ -817,7 +821,7 @@ z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
 	} else {
 		atomic_add_64(&sbi->decompress_queue_fallbacks, 1);
 		error = z_erofs_decode_extent(sbi, vi, map, decoded_len,
-		    partial, bufp);
+		    partial, input, bufp);
 	}
 	cv_destroy(&task->cv);
 	mtx_destroy(&task->lock);
@@ -908,7 +912,7 @@ z_erofs_do_read(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 			} else
 				z_erofs_extent_cache_record_bypass(sbi, &map);
 			error = z_erofs_decode_extent_dispatch(sbi, vi, &map,
-			    decoded_len, partial, &decoded);
+			    decoded_len, partial, NULL, &decoded);
 			if (error != 0) {
 				if (cache_lookup == Z_EROFS_CACHE_OWNER)
 					z_erofs_extent_cache_complete(sbi, vi,
@@ -974,62 +978,207 @@ z_erofs_read_uio(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 	return (0);
 }
 
-/* An extent can only be decoded as a whole. */
-struct z_erofs_decoded_extent {
-	struct erofs_map_blocks map;
-	/* NULL for a hole or a fragment. */
+#define Z_EROFS_WINDOW_MAX_EXTENTS 1024
+
+/*
+ * An extent can only be decoded as a whole, so the extents that the pages of
+ * one request live in are decoded in order, each of them once.
+ */
+struct z_erofs_window {
+	struct erofs_sb_info *sbi;
+	struct erofs_inode *vi;
+	struct erofs_map_blocks *maps;
+	unsigned int nmaps;
+	unsigned int cap;
+	/*
+	 * The extent in data, or UINT_MAX.  Data is NULL for a hole or a
+	 * fragment.
+	 */
+	unsigned int cur;
 	void *data;
+	/* The compressed data of consecutive extents, read at once. */
+	struct erofs_buf run;
+	erofs_off_t run_pa;
+	size_t run_len;
+	unsigned short run_dev;
+	bool sequential;
 };
 
-static bool
-z_erofs_decoded_covers(const struct z_erofs_decoded_extent *ext,
-    erofs_off_t pos)
+static void
+z_erofs_window_init(struct z_erofs_window *win, struct erofs_sb_info *sbi,
+    struct erofs_inode *vi, bool sequential)
 {
-	return (ext->map.m_llen != 0 && pos >= ext->map.m_la &&
-	    pos - ext->map.m_la < ext->map.m_llen);
+	bzero(win, sizeof(*win));
+	win->sbi = sbi;
+	win->vi = vi;
+	win->cur = UINT_MAX;
+	win->sequential = sequential;
 }
 
+static void
+z_erofs_window_fini(struct z_erofs_window *win)
+{
+	erofs_put_metabuf(&win->run);
+	free(win->data, M_EROFS);
+	free(win->maps, M_EROFS);
+}
+
+/*
+ * Map the extents from pos to target.  Those that end before reqend are
+ * needed, the others only read ahead.
+ */
 static int
-z_erofs_decoded_load(struct erofs_sb_info *sbi, struct erofs_inode *vi,
-    erofs_off_t pos, struct z_erofs_decoded_extent *ext)
+z_erofs_window_map(struct z_erofs_window *win, erofs_off_t pos,
+    erofs_off_t reqend, erofs_off_t target)
 {
 	struct erofs_map_blocks *map;
 	int error;
 
-	free(ext->data, M_EROFS);
-	ext->data = NULL;
-	map = &ext->map;
-	error = z_erofs_map_pos(sbi, vi, pos, map);
-	if (error != 0)
-		return (error);
-	if ((map->m_flags & (EROFS_MAP_FRAGMENT | EROFS_MAP_MAPPED)) !=
-	    EROFS_MAP_MAPPED)
-		return (0);
-	return (z_erofs_decode_extent_dispatch(sbi, vi, map, map->m_llen,
-	    (map->m_flags & EROFS_MAP_PARTIAL_REF) != 0, &ext->data));
+	while (pos < target) {
+		if (pos >= reqend && win->nmaps >= Z_EROFS_WINDOW_MAX_EXTENTS)
+			break;
+		if (win->nmaps == win->cap) {
+			win->cap = win->cap == 0 ? 8 : win->cap * 2;
+			win->maps = realloc(win->maps,
+			    win->cap * sizeof(*win->maps), M_EROFS, M_WAITOK);
+		}
+		map = &win->maps[win->nmaps];
+		error = z_erofs_map_pos(win->sbi, win->vi, pos, map);
+		if (error != 0)
+			return (pos >= reqend ? 0 : error);
+		++win->nmaps;
+		pos = map->m_la + map->m_llen;
+	}
+	return (0);
+}
+
+static bool
+z_erofs_extent_is_stored(const struct erofs_map_blocks *map)
+{
+	unsigned int where;
+
+	where = map->m_flags &
+	    (EROFS_MAP_FRAGMENT | EROFS_MAP_MAPPED | EROFS_MAP_META);
+	return (where == EROFS_MAP_MAPPED);
 }
 
 static int
-z_erofs_decoded_copy(struct erofs_sb_info *sbi, struct erofs_inode *vi,
-    const struct z_erofs_decoded_extent *ext, erofs_off_t pos, size_t len,
-    char *out)
+z_erofs_window_input(struct z_erofs_window *win, unsigned int idx,
+    const void **inputp)
 {
-	erofs_off_t mapoff;
+	const struct erofs_map_blocks *map, *next;
+	erofs_off_t end;
+	size_t len;
+	unsigned int i;
+	int error;
 
-	mapoff = pos - ext->map.m_la;
-	if ((ext->map.m_flags & EROFS_MAP_FRAGMENT) != 0)
-		return (z_erofs_read_fragment(sbi, vi, mapoff, len, out));
-	if (ext->data == NULL)
-		bzero(out, len);
-	else
-		memcpy(out, (const char *)ext->data + mapoff, len);
+	map = &win->maps[idx];
+	*inputp = NULL;
+	if (!z_erofs_extent_is_stored(map))
+		return (0);
+	if (win->run.data == NULL || map->m_deviceid != win->run_dev ||
+	    map->m_pa < win->run_pa ||
+	    map->m_pa + map->m_plen > win->run_pa + win->run_len) {
+		end = map->m_pa + map->m_plen;
+		for (i = idx + 1; i < win->nmaps; i++) {
+			next = &win->maps[i];
+			if (!z_erofs_extent_is_stored(next) ||
+			    next->m_deviceid != map->m_deviceid ||
+			    next->m_pa != end ||
+			    end - map->m_pa + next->m_plen > maxphys)
+				break;
+			end += next->m_plen;
+		}
+		len = end - map->m_pa;
+		erofs_put_metabuf(&win->run);
+		error = erofs_read_physical_bulk(win->sbi, map->m_deviceid,
+		    map->m_pa, len, win->sequential, &win->run);
+		/* A run can cross over to the next device of a flat image. */
+		if (error != 0 && len > map->m_plen) {
+			len = map->m_plen;
+			error = erofs_read_physical_bulk(win->sbi,
+			    map->m_deviceid, map->m_pa, len, win->sequential,
+			    &win->run);
+		}
+		if (error != 0)
+			return (error);
+		win->run_pa = map->m_pa;
+		win->run_len = len;
+		win->run_dev = map->m_deviceid;
+	}
+	*inputp = (const char *)win->run.data + (map->m_pa - win->run_pa);
 	return (0);
 }
 
 static int
-z_erofs_fill_page(struct erofs_sb_info *sbi, struct erofs_inode *vi,
-    vm_page_t m, struct z_erofs_decoded_extent *ext)
+z_erofs_window_load(struct z_erofs_window *win, unsigned int idx)
 {
+	struct erofs_map_blocks *map;
+	const void *input;
+	int error;
+
+	free(win->data, M_EROFS);
+	win->data = NULL;
+	win->cur = UINT_MAX;
+	map = &win->maps[idx];
+	if ((map->m_flags & (EROFS_MAP_FRAGMENT | EROFS_MAP_MAPPED)) ==
+	    EROFS_MAP_MAPPED) {
+		error = z_erofs_window_input(win, idx, &input);
+		if (error == 0)
+			error = z_erofs_decode_extent_dispatch(win->sbi,
+			    win->vi, map, map->m_llen,
+			    (map->m_flags & EROFS_MAP_PARTIAL_REF) != 0, input,
+			    &win->data);
+		if (error != 0)
+			return (error);
+	}
+	win->cur = idx;
+	return (0);
+}
+
+static int
+z_erofs_window_seek(struct z_erofs_window *win, erofs_off_t pos)
+{
+	const struct erofs_map_blocks *map;
+	unsigned int idx;
+
+	idx = win->cur != UINT_MAX && pos >= win->maps[win->cur].m_la ?
+	    win->cur :
+	    0;
+	for (; idx < win->nmaps; idx++) {
+		map = &win->maps[idx];
+		if (pos < map->m_la || pos - map->m_la >= map->m_llen)
+			continue;
+		if (idx == win->cur)
+			return (0);
+		return (z_erofs_window_load(win, idx));
+	}
+	return (EINTEGRITY);
+}
+
+static int
+z_erofs_window_copy(struct z_erofs_window *win, erofs_off_t pos, size_t len,
+    char *out)
+{
+	const struct erofs_map_blocks *map;
+	erofs_off_t mapoff;
+
+	map = &win->maps[win->cur];
+	mapoff = pos - map->m_la;
+	if ((map->m_flags & EROFS_MAP_FRAGMENT) != 0)
+		return (
+		    z_erofs_read_fragment(win->sbi, win->vi, mapoff, len, out));
+	if (win->data == NULL)
+		bzero(out, len);
+	else
+		memcpy(out, (const char *)win->data + mapoff, len);
+	return (0);
+}
+
+static int
+z_erofs_fill_page(struct z_erofs_window *win, vm_page_t m)
+{
+	const struct erofs_map_blocks *map;
 	struct sf_buf *sf;
 	erofs_off_t end, pos;
 	size_t done, len;
@@ -1037,19 +1186,17 @@ z_erofs_fill_page(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 	int error;
 
 	pos = IDX_TO_OFF(m->pindex);
-	end = MIN(pos + PAGE_SIZE, vi->size);
+	end = MIN(pos + PAGE_SIZE, win->vi->size);
 	sf = sf_buf_alloc(m, 0);
 	va = (char *)sf_buf_kva(sf);
 	error = 0;
 	for (done = 0; pos + done < end; done += len) {
-		if (!z_erofs_decoded_covers(ext, pos + done)) {
-			error = z_erofs_decoded_load(sbi, vi, pos + done, ext);
-			if (error != 0)
-				break;
-		}
-		len = MIN(end, ext->map.m_la + ext->map.m_llen) - (pos + done);
-		error = z_erofs_decoded_copy(sbi, vi, ext, pos + done, len,
-		    va + done);
+		error = z_erofs_window_seek(win, pos + done);
+		if (error != 0)
+			break;
+		map = &win->maps[win->cur];
+		len = MIN(end, map->m_la + map->m_llen) - (pos + done);
+		error = z_erofs_window_copy(win, pos + done, len, va + done);
 		if (error != 0)
 			break;
 	}
@@ -1063,19 +1210,18 @@ z_erofs_fill_page(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 
 /* rbehind and rahead count contiguous pages, so the caller stops at a miss. */
 static bool
-z_erofs_fill_extra_page(vm_object_t obj, vm_pindex_t pindex,
-    const struct z_erofs_decoded_extent *ext, erofs_off_t size)
+z_erofs_fill_extra_page(struct z_erofs_window *win, vm_object_t obj,
+    vm_pindex_t pindex)
 {
-	struct sf_buf *sf;
-	erofs_off_t end, extent_end, pos;
+	const struct erofs_map_blocks *last;
+	erofs_off_t end, pos;
 	vm_page_t m;
-	char *va;
 
 	pos = IDX_TO_OFF(pindex);
-	extent_end = ext->map.m_la + ext->map.m_llen;
-	end = MIN(pos + PAGE_SIZE, extent_end);
-	if (ext->data == NULL || pos < ext->map.m_la || pos >= end ||
-	    (end - pos < PAGE_SIZE && extent_end != size))
+	end = MIN(pos + PAGE_SIZE, win->vi->size);
+	last = &win->maps[win->nmaps - 1];
+	if (pos < win->maps[0].m_la || pos >= end ||
+	    end > last->m_la + last->m_llen)
 		return (false);
 	m = vm_page_grab_unlocked(obj, pindex,
 	    VM_ALLOC_NORMAL | VM_ALLOC_NOWAIT);
@@ -1085,36 +1231,36 @@ z_erofs_fill_extra_page(vm_object_t obj, vm_pindex_t pindex,
 		vm_page_xunbusy(m);
 		return (true);
 	}
-	sf = sf_buf_alloc(m, 0);
-	va = (char *)sf_buf_kva(sf);
-	memcpy(va, (const char *)ext->data + (pos - ext->map.m_la), end - pos);
-	bzero(va + (end - pos), PAGE_SIZE - (end - pos));
-	sf_buf_free(sf);
-	vm_page_valid(m);
+	if (z_erofs_fill_page(win, m) != 0) {
+		VM_OBJECT_WLOCK(obj);
+		vm_page_free_invalid(m);
+		VM_OBJECT_WUNLOCK(obj);
+		return (false);
+	}
 	vm_page_readahead_finish(m);
 	return (true);
 }
 
 static int
-z_erofs_fill_behind(vm_object_t obj, vm_pindex_t first,
-    const struct z_erofs_decoded_extent *ext, erofs_off_t size)
+z_erofs_fill_behind(struct z_erofs_window *win, vm_object_t obj,
+    vm_pindex_t first)
 {
 	vm_pindex_t n;
 
 	for (n = 0; n < first; n++) {
-		if (!z_erofs_fill_extra_page(obj, first - 1 - n, ext, size))
+		if (!z_erofs_fill_extra_page(win, obj, first - 1 - n))
 			break;
 	}
 	return (n);
 }
 
 static int
-z_erofs_fill_ahead(vm_object_t obj, vm_pindex_t last,
-    const struct z_erofs_decoded_extent *ext, erofs_off_t size)
+z_erofs_fill_ahead(struct z_erofs_window *win, vm_object_t obj,
+    vm_pindex_t last)
 {
 	vm_pindex_t n;
 
-	for (n = 0; z_erofs_fill_extra_page(obj, last + 1 + n, ext, size); n++)
+	for (n = 0; z_erofs_fill_extra_page(win, obj, last + 1 + n); n++)
 		;
 	return (n);
 }
@@ -1123,10 +1269,12 @@ int
 z_erofs_getpages(struct vnode *vp, vm_page_t *ma, int count, int *rbehind,
     int *rahead)
 {
-	struct z_erofs_decoded_extent ext;
+	struct z_erofs_window win;
 	struct erofs_sb_info *sbi;
 	struct erofs_inode *vi;
 	vm_object_t obj;
+	erofs_off_t pos, reqend, target;
+	vm_pindex_t last;
 	int ahead, behind, error, i;
 
 	if (VN_IS_DOOMED(vp))
@@ -1134,28 +1282,33 @@ z_erofs_getpages(struct vnode *vp, vm_page_t *ma, int count, int *rbehind,
 	sbi = MTOE(vp->v_mount);
 	vi = VTOE(vp);
 	obj = ma[0]->object;
-	KASSERT(IDX_TO_OFF(ma[0]->pindex) < vi->size,
+	pos = IDX_TO_OFF(ma[0]->pindex);
+	last = ma[count - 1]->pindex;
+	KASSERT(pos < vi->size,
 	    ("erofs: page %ju is beyond the size %ju of the file",
 		(uintmax_t)ma[0]->pindex, (uintmax_t)vi->size));
-	EROFS_TRACE_READ_FOLIO(vi, IDX_TO_OFF(ma[0]->pindex), ptoa(count),
-	    false);
+	EROFS_TRACE_READ_FOLIO(vi, pos, ptoa(count), false);
 
-	bzero(&ext, sizeof(ext));
+	reqend = MIN(IDX_TO_OFF(last + 1), vi->size);
+	target = rahead != NULL ?
+	    MIN(IDX_TO_OFF(last + 1 + *rahead), vi->size) :
+	    reqend;
+	z_erofs_window_init(&win, sbi, vi, rahead != NULL && *rahead != 0);
 	behind = 0;
 	ahead = 0;
-	error = z_erofs_decoded_load(sbi, vi, IDX_TO_OFF(ma[0]->pindex), &ext);
+	error = z_erofs_window_map(&win, pos, reqend, target);
 	if (error == 0)
-		behind = z_erofs_fill_behind(obj, ma[0]->pindex, &ext,
-		    vi->size);
+		error = z_erofs_window_seek(&win, pos);
+	if (error == 0)
+		behind = z_erofs_fill_behind(&win, obj, ma[0]->pindex);
 	/* sendfile(2) passes the valid pages as bogus_page. */
 	for (i = 0; error == 0 && i < count; i++) {
 		if (ma[i] != bogus_page)
-			error = z_erofs_fill_page(sbi, vi, ma[i], &ext);
+			error = z_erofs_fill_page(&win, ma[i]);
 	}
 	if (error == 0)
-		ahead = z_erofs_fill_ahead(obj, ma[count - 1]->pindex, &ext,
-		    vi->size);
-	free(ext.data, M_EROFS);
+		ahead = z_erofs_fill_ahead(&win, obj, last);
+	z_erofs_window_fini(&win);
 	if (error != 0)
 		return (VM_PAGER_ERROR);
 

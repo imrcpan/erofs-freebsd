@@ -296,6 +296,7 @@ struct erofs_decompress_task {
 	struct erofs_map_blocks map;
 	size_t decoded_len;
 	bool partial;
+	const void *input;
 	void *decoded;
 	int error;
 	bool done;
@@ -600,6 +601,8 @@ int erofs_bread(struct erofs_sb_info *sbi, erofs_off_t off, size_t len,
     void **bufp);
 int erofs_read_physical(struct erofs_sb_info *sbi, unsigned int device_id,
     erofs_off_t off, size_t len, void **bufp);
+int erofs_read_physical_bulk(struct erofs_sb_info *sbi, unsigned int device_id,
+    erofs_off_t off, size_t len, bool sequential, struct erofs_buf *buf);
 void erofs_brelse(void *buf);
 int erofs_read_metadata_range(struct erofs_sb_info *sbi, erofs_nid_t nid,
     erofs_off_t off, size_t len, struct erofs_buf *buf);
@@ -619,7 +622,8 @@ int erofs_readlink_target(struct vnode *vp, struct uio *uio);
 
 /* File-backed source I/O is owned by fileio.c. */
 int erofs_read_file_source(struct erofs_sb_info *sbi,
-    struct erofs_device_info *dif, erofs_off_t off, size_t len, void *out);
+    struct erofs_device_info *dif, erofs_off_t off, size_t len, void *out,
+    bool sequential);
 
 /* Inode and vnode lifecycle. */
 bool erofs_nid_is_valid(struct erofs_sb_info *sbi, erofs_nid_t nid);
@@ -671,10 +675,10 @@ int z_erofs_decompress(struct erofs_sb_info *sbi,
     void *dst, size_t dstlen, bool partial);
 int z_erofs_decode_extent(struct erofs_sb_info *sbi, struct erofs_inode *vi,
     struct erofs_map_blocks *map, size_t decoded_len, bool partial,
-    void **bufp);
+    const void *input, void **bufp);
 int z_erofs_decode_extent_dispatch(struct erofs_sb_info *sbi,
     struct erofs_inode *vi, struct erofs_map_blocks *map, size_t decoded_len,
-    bool partial, void **bufp);
+    bool partial, const void *input, void **bufp);
 
 /* Compression configuration. */
 int z_erofs_parse_cfgs(struct erofs_sb_info *sbi,

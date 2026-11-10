@@ -45,9 +45,10 @@ erofs_read_file_source_direct(struct erofs_device_info *dif, erofs_off_t off,
 
 int
 erofs_read_file_source(struct erofs_sb_info *sbi, struct erofs_device_info *dif,
-    erofs_off_t off, size_t len, void *out)
+    erofs_off_t off, size_t len, void *out, bool sequential)
 {
 	if (test_opt(&sbi->opt, DIRECT_IO))
 		return (erofs_read_file_source_direct(dif, off, len, out));
-	return (erofs_read_file_source_vnrdwr(dif, off, len, out, 0));
+	return (erofs_read_file_source_vnrdwr(dif, off, len, out,
+	    sequential ? IO_SEQMAX << IO_SEQSHIFT : 0));
 }

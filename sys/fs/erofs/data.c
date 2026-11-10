@@ -21,6 +21,7 @@
 
 #include <fs/erofs/internal.h>
 #include <fs/erofs/trace.h>
+#include <geom/geom.h>
 
 #define EROFS_DIR_READAHEAD_SLOTS 256
 
@@ -67,23 +68,12 @@ erofs_breadn_devvp(struct vnode *devvp, daddr_t blkno, int size,
 }
 
 static int
-erofs_bread_device(struct erofs_sb_info *sbi, struct erofs_device_info *dif,
-    erofs_blk_t blocks, erofs_off_t off, size_t len, daddr_t *rablkno,
-    int *rabsize, int racnt, void **bufp)
+erofs_device_span(struct erofs_sb_info *sbi,
+    const struct erofs_device_info *dif, erofs_blk_t blocks, erofs_off_t off,
+    size_t len, erofs_off_t *device_offp)
 {
-	struct buf *bp;
 	erofs_off_t device_end, device_off, end, limit;
-	off_t blkoff, current;
-	size_t blklen, done, iosize;
-	char *out;
-	int error;
 
-	if (bufp == NULL)
-		return (EINVAL);
-	*bufp = NULL;
-	if (len == 0) {
-		return (0);
-	}
 	if (!erofs_source_is_open(dif))
 		return (ENODEV);
 	if (__builtin_add_overflow(off, (uint64_t)len, &end))
@@ -108,13 +98,39 @@ erofs_bread_device(struct erofs_sb_info *sbi, struct erofs_device_info *dif,
 		return (ENXIO);
 	if (device_off > INT64_MAX || device_end > (uint64_t)INT64_MAX + 1)
 		return (EOVERFLOW);
+	*device_offp = device_off;
+	return (0);
+}
+
+static int
+erofs_bread_device(struct erofs_sb_info *sbi, struct erofs_device_info *dif,
+    erofs_blk_t blocks, erofs_off_t off, size_t len, daddr_t *rablkno,
+    int *rabsize, int racnt, void **bufp)
+{
+	struct buf *bp;
+	erofs_off_t device_off;
+	off_t blkoff, current;
+	size_t blklen, done, iosize;
+	char *out;
+	int error;
+
+	if (bufp == NULL)
+		return (EINVAL);
+	*bufp = NULL;
+	if (len == 0) {
+		return (0);
+	}
+	error = erofs_device_span(sbi, dif, blocks, off, len, &device_off);
+	if (error != 0)
+		return (error);
 
 	iosize = sbi->block_size != 0 ? sbi->block_size : dif->sectorsize;
 	if (iosize == 0 || (iosize & (iosize - 1)) != 0)
 		return (EINVAL);
 	out = malloc(len, M_EROFS, M_WAITOK);
 	if (erofs_source_is_file(dif)) {
-		error = erofs_read_file_source(sbi, dif, device_off, len, out);
+		error = erofs_read_file_source(sbi, dif, device_off, len, out,
+		    false);
 		if (error != 0) {
 			free(out, M_EROFS);
 			return (error);
@@ -499,6 +515,26 @@ erofs_map_dev(struct erofs_sb_info *sbi, struct erofs_map_dev *map)
 	return (error);
 }
 
+static int
+erofs_map_physical(struct erofs_sb_info *sbi, unsigned int device_id,
+    erofs_off_t off, size_t len, struct erofs_map_dev *map, erofs_blk_t *blocks)
+{
+	int error;
+
+	*map = (struct erofs_map_dev) {
+		.m_pa = off,
+		.m_deviceid = device_id,
+		.m_plen = len,
+	};
+	error = erofs_map_dev(sbi, map);
+	if (error != 0)
+		return (error);
+	*blocks = map->m_dif->blocks;
+	if (map->m_dif == &sbi->dif0 && sbi->flatdev)
+		*blocks = sbi->flatdev_blocks;
+	return (0);
+}
+
 int
 erofs_read_physical(struct erofs_sb_info *sbi, unsigned int device_id,
     erofs_off_t off, size_t len, void **bufp)
@@ -507,19 +543,67 @@ erofs_read_physical(struct erofs_sb_info *sbi, unsigned int device_id,
 	erofs_blk_t blocks;
 	int error;
 
-	map = (struct erofs_map_dev) {
-		.m_pa = off,
-		.m_deviceid = device_id,
-		.m_plen = len,
-	};
-	error = erofs_map_dev(sbi, &map);
+	error = erofs_map_physical(sbi, device_id, off, len, &map, &blocks);
 	if (error != 0)
 		return (error);
-	blocks = map.m_dif->blocks;
-	if (map.m_dif == &sbi->dif0 && sbi->flatdev)
-		blocks = sbi->flatdev_blocks;
 	return (erofs_bread_device(sbi, map.m_dif, blocks, map.m_pa, len, NULL,
 	    NULL, 0, bufp));
+}
+
+int
+erofs_read_physical_bulk(struct erofs_sb_info *sbi, unsigned int device_id,
+    erofs_off_t off, size_t len, bool sequential, struct erofs_buf *buf)
+{
+	struct erofs_map_dev map;
+	struct erofs_device_info *dif;
+	erofs_off_t device_off;
+	erofs_blk_t blocks;
+	void *data;
+	int error;
+
+	error = erofs_map_physical(sbi, device_id, off, len, &map, &blocks);
+	if (error != 0)
+		return (error);
+	dif = map.m_dif;
+	if (erofs_source_is_file(dif)) {
+		error = erofs_device_span(sbi, dif, blocks, map.m_pa, len,
+		    &device_off);
+		if (error != 0)
+			return (error);
+		data = malloc(len, M_EROFS, M_WAITOK);
+		error = erofs_read_file_source(sbi, dif, device_off, len, data,
+		    sequential);
+		if (error != 0) {
+			free(data, M_EROFS);
+			return (error);
+		}
+		buf->data = data;
+		buf->release = erofs_brelse;
+		return (0);
+	}
+	/* The buffer cache would read the blocks one by one. */
+	if (len > sbi->block_size && len <= maxphys && dif->cp != NULL &&
+	    erofs_source_is_open(dif)) {
+		error = erofs_device_span(sbi, dif, blocks, map.m_pa, len,
+		    &device_off);
+		if (error != 0)
+			return (error);
+		if (((device_off | len) & (dif->sectorsize - 1)) == 0) {
+			data = g_read_data(dif->cp, device_off, len, &error);
+			if (data == NULL)
+				return (error != 0 ? error : EIO);
+			buf->data = data;
+			buf->release = g_free;
+			return (0);
+		}
+	}
+	error = erofs_bread_device(sbi, dif, blocks, map.m_pa, len, NULL, NULL,
+	    0, &data);
+	if (error != 0)
+		return (error);
+	buf->data = data;
+	buf->release = erofs_brelse;
+	return (0);
 }
 
 static int
