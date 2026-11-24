@@ -535,6 +535,68 @@ erofs_map_physical(struct erofs_sb_info *sbi, unsigned int device_id,
 	return (0);
 }
 
+/*
+ * Query only flat external data.  These mappings are arithmetic, so this
+ * lookup is safe in strategy as well as BMAP.  The run bounds both the file
+ * buffer request and the forward run advertised to the VM.
+ */
+int
+erofs_vmio_map(struct vnode *file_vnode, daddr_t file_lbn,
+    struct erofs_vmio_extent *extent)
+{
+	struct erofs_sb_info *sbi;
+	struct erofs_inode *vi;
+	struct erofs_map_blocks file_map;
+	struct erofs_map_dev device_map;
+	erofs_off_t device_offset, file_offset;
+	erofs_blk_t device_blocks;
+	size_t mapped_bytes;
+	int error;
+
+	if (file_vnode->v_type != VREG || file_vnode->v_object == NULL ||
+	    file_vnode->v_bufobj.bo_bsize != PAGE_SIZE ||
+	    file_vnode->v_mount->mnt_stat.f_iosize != PAGE_SIZE ||
+	    file_vnode->v_mount->mnt_iosize_max < PAGE_SIZE)
+		return (EOPNOTSUPP);
+	sbi = MTOE(file_vnode->v_mount);
+	vi = VTOE(file_vnode);
+	if (sbi->block_size != PAGE_SIZE || sbi->extra_devices != 0 ||
+	    sbi->dif0.source_kind != EROFS_SOURCE_BLOCK ||
+	    (vi->datalayout != EROFS_INODE_FLAT_PLAIN &&
+		vi->datalayout != EROFS_INODE_FLAT_INLINE))
+		return (EOPNOTSUPP);
+	if (file_lbn < 0 || (uint64_t)file_lbn >= (vi->size >> PAGE_SHIFT))
+		return (EOPNOTSUPP);
+	file_offset = (uint64_t)file_lbn << PAGE_SHIFT;
+	file_map = (struct erofs_map_blocks) { .m_la = file_offset };
+	error = erofs_map_blocks_flatmode(sbi, vi, &file_map);
+	if (error != 0)
+		return (error);
+	if (file_map.m_flags != EROFS_MAP_MAPPED)
+		return (EOPNOTSUPP);
+	/* flatmode stops at inline_tail_start, even for block-aligned EOF. */
+	mapped_bytes = rounddown2(MIN(file_map.m_llen, (uint64_t)SIZE_MAX),
+	    (uint64_t)PAGE_SIZE);
+	if (mapped_bytes == 0)
+		return (EOPNOTSUPP);
+	error = erofs_map_physical(sbi, file_map.m_deviceid, file_map.m_pa,
+	    mapped_bytes, &device_map, &device_blocks);
+	if (error != 0)
+		return (error);
+	error = erofs_device_span(sbi, device_map.m_dif, device_blocks,
+	    device_map.m_pa, mapped_bytes, &device_offset);
+	if (error != 0)
+		return (error);
+	if (device_map.m_dif->sectorsize > PAGE_SIZE ||
+	    (device_offset & (device_map.m_dif->sectorsize - 1)) != 0 ||
+	    (device_offset & (DEV_BSIZE - 1)) != 0)
+		return (EOPNOTSUPP);
+	extent->device_bufobj = &device_map.m_dif->devvp->v_bufobj;
+	extent->device_blkno = btodb(device_offset);
+	extent->mapped_bytes = mapped_bytes;
+	return (0);
+}
+
 int
 erofs_read_physical(struct erofs_sb_info *sbi, unsigned int device_id,
     erofs_off_t off, size_t len, void **bufp)
@@ -886,11 +948,90 @@ erofs_read_uio(struct vnode *vp, struct uio *uio)
 	return (0);
 }
 
+static int
+erofs_get_vmio_buf(struct vnode *file_vnode, const struct uio *uio,
+    erofs_off_t extent_end, int ioflag, struct buf **file_bufp)
+{
+	struct mount *file_mount;
+	uint64_t span_bytes;
+	daddr_t file_lbn;
+	long demand_bytes;
+
+	file_mount = file_vnode->v_mount;
+	file_lbn = uio->uio_offset >> PAGE_SHIFT;
+	if ((file_mount->mnt_flag & MNT_NOCLUSTERR) != 0)
+		return (
+		    bread(file_vnode, file_lbn, PAGE_SIZE, NOCRED, file_bufp));
+
+	/* cluster_read() measures demand from the start of the file block. */
+	span_bytes = extent_end - uio->uio_offset;
+	span_bytes = MIN(span_bytes, (uint64_t)uio->uio_resid);
+	span_bytes += (uio->uio_offset & PAGE_MASK);
+	demand_bytes = MIN(span_bytes, (uint64_t)file_mount->mnt_iosize_max);
+	return (cluster_read(file_vnode, extent_end, file_lbn, PAGE_SIZE,
+	    NOCRED, demand_bytes, ioflag >> IO_SEQSHIFT, 0, file_bufp));
+}
+
+static int
+erofs_read_vmio_extent(struct vnode *file_vnode, struct uio *uio,
+    erofs_off_t extent_end, int ioflag)
+{
+	struct buf *file_buf;
+	size_t offset_in_page, copy_bytes;
+	int error;
+
+	while (
+	    uio->uio_resid > 0 && (erofs_off_t)uio->uio_offset < extent_end) {
+		error = erofs_get_vmio_buf(file_vnode, uio, extent_end, ioflag,
+		    &file_buf);
+		if (error != 0)
+			return (error);
+		if (file_buf->b_resid != 0 || file_buf->b_bcount != PAGE_SIZE)
+			error = EIO;
+		else {
+			offset_in_page = uio->uio_offset & PAGE_MASK;
+			copy_bytes = MIN((size_t)uio->uio_resid,
+			    PAGE_SIZE - offset_in_page);
+			error = uiomove(file_buf->b_data + offset_in_page,
+			    copy_bytes, uio);
+		}
+		brelse(file_buf);
+		if (error != 0)
+			return (error);
+	}
+	return (0);
+}
+
 /* Read regular file data. */
 int
-erofs_read_file(struct vnode *vp, struct uio *uio)
+erofs_read_file(struct vnode *file_vnode, struct uio *uio, int ioflag)
 {
-	return (erofs_read_uio(vp, uio));
+	struct erofs_vmio_extent extent;
+	erofs_off_t extent_end;
+	daddr_t file_lbn;
+	int error;
+
+	/* The legacy vnode pager calls VOP_READ into an xbusy page. */
+	if (uio->uio_offset < 0 || (ioflag & IO_DIRECT) != 0 ||
+	    uio->uio_segflg == UIO_SYSSPACE)
+		return (erofs_read_uio(file_vnode, uio));
+
+	while (uio->uio_resid > 0) {
+		file_lbn = uio->uio_offset >> PAGE_SHIFT;
+		error = erofs_vmio_map(file_vnode, file_lbn, &extent);
+		if (error == EOPNOTSUPP)
+			return (erofs_read_uio(file_vnode, uio));
+		if (error != 0)
+			return (error);
+
+		extent_end = ((erofs_off_t)file_lbn << PAGE_SHIFT) +
+		    extent.mapped_bytes;
+		error = erofs_read_vmio_extent(file_vnode, uio, extent_end,
+		    ioflag);
+		if (error != 0)
+			return (error);
+	}
+	return (0);
 }
 
 int

@@ -4,15 +4,21 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/bio.h>
+#include <sys/buf.h>
 #include <sys/extattr.h>
 #include <sys/filio.h>
 #include <sys/fnv_hash.h>
 #include <sys/libkern.h>
 #include <sys/limits.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
+#include <sys/rwlock.h>
+#include <sys/sf_buf.h>
 #include <sys/stat.h>
 #include <sys/unistd.h>
+#include <sys/vmmeter.h>
 #include <sys/vnode.h>
 
 #ifdef UFS_ACL
@@ -20,6 +26,9 @@
 #endif
 
 #include <vm/vm.h>
+#include <vm/vm_object.h>
+#include <vm/vm_page.h>
+#include <vm/vm_pager.h>
 #include <vm/vnode_pager.h>
 
 #include <fs/erofs/internal.h>
@@ -35,6 +44,7 @@ static vop_open_t erofs_open;
 static vop_read_t erofs_read;
 static vop_getpages_t erofs_getpages;
 static vop_bmap_t erofs_bmap;
+static vop_strategy_t erofs_strategy;
 static vop_ioctl_t erofs_ioctl;
 
 static vop_getattr_t erofs_getattr;
@@ -104,26 +114,111 @@ erofs_access(struct vop_access_args *ap)
 #endif
 }
 
-/*
- * Tell the generic pager that EROFS does not provide block-level bmap.
- *
- * Returning EOPNOTSUPP prevents the pager from assuming a bufobj/strategy is
- * available, avoiding "No strategy for buffer" errors.  VM will correctly
- * fall back to the VOP_READ-based page-in path.  The default async VOP wrapper
- * must remain in use so synchronous fallback completion still calls iodone.
- */
 static int
-erofs_bmap(struct vop_bmap_args *ap)
+erofs_bmap(struct vop_bmap_args *bmap_args)
 {
-	if (ap->a_bop != NULL)
-		*ap->a_bop = NULL;
-	if (ap->a_bnp != NULL)
-		*ap->a_bnp = -1;
-	if (ap->a_runp != NULL)
-		*ap->a_runp = 0;
-	if (ap->a_runb != NULL)
-		*ap->a_runb = 0;
-	return (EOPNOTSUPP);
+	struct erofs_vmio_extent extent;
+	size_t max_io_bytes, run_pages;
+	int error;
+
+	if (bmap_args->a_bop != NULL)
+		*bmap_args->a_bop = NULL;
+	if (bmap_args->a_bnp != NULL)
+		*bmap_args->a_bnp = -1;
+	if (bmap_args->a_runp != NULL)
+		*bmap_args->a_runp = 0;
+	if (bmap_args->a_runb != NULL)
+		*bmap_args->a_runb = 0;
+	error = erofs_vmio_map(bmap_args->a_vp, bmap_args->a_bn, &extent);
+	if (error != 0)
+		return (error);
+	if (bmap_args->a_bop != NULL)
+		*bmap_args->a_bop = extent.device_bufobj;
+	if (bmap_args->a_bnp != NULL)
+		*bmap_args->a_bnp = extent.device_blkno;
+	if (bmap_args->a_runp != NULL) {
+		max_io_bytes = bmap_args->a_vp->v_mount->mnt_iosize_max;
+		run_pages = MIN(extent.mapped_bytes, max_io_bytes) / PAGE_SIZE;
+
+		/* The forward run excludes the current block. */
+		*bmap_args->a_runp = run_pages - 1;
+	}
+	return (0);
+}
+
+/* VMIO uses the residual count when setting valid bits, even on error. */
+static void
+erofs_buf_error(struct buf *io_buf, int error)
+{
+	struct buf *child_buf;
+
+	io_buf->b_ioflags |= BIO_ERROR;
+	io_buf->b_error = error;
+	io_buf->b_resid = io_buf->b_bcount;
+
+	if ((io_buf->b_flags & B_CLUSTER) == 0)
+		return;
+
+	/* cluster_callback propagates the errno but not the residual. */
+	TAILQ_FOREACH(child_buf, &io_buf->b_cluster.cluster_head,
+	    b_cluster.cluster_entry)
+		child_buf->b_resid = child_buf->b_bcount;
+}
+
+/* A short GEOM read must fail before VMIO or the cluster validates pages. */
+static void
+erofs_read_done(struct buf *io_buf)
+{
+	int error;
+
+	error = 0;
+	if ((io_buf->b_ioflags & BIO_ERROR) != 0) {
+		error = io_buf->b_error;
+		if (error == 0)
+			error = EIO;
+	} else if (io_buf->b_resid != 0) {
+		error = EIO;
+	}
+
+	if (error != 0)
+		erofs_buf_error(io_buf, error);
+
+	io_buf->b_iodone = io_buf->b_fsprivate1;
+	io_buf->b_fsprivate1 = NULL;
+	bufdone(io_buf);
+}
+
+static int
+erofs_strategy(struct vop_strategy_args *strategy_args)
+{
+	struct erofs_vmio_extent extent;
+	struct buf *io_buf;
+	int error;
+
+	io_buf = strategy_args->a_bp;
+	if (io_buf->b_iocmd != BIO_READ)
+		error = EROFS;
+	else {
+		error = erofs_vmio_map(strategy_args->a_vp, io_buf->b_lblkno,
+		    &extent);
+		if (error == 0 &&
+		    (io_buf->b_bcount <= 0 ||
+			(io_buf->b_bcount & PAGE_MASK) != 0 ||
+			(size_t)io_buf->b_bcount > extent.mapped_bytes))
+			error = EIO;
+	}
+	if (error != 0) {
+		erofs_buf_error(io_buf, error);
+		bufdone(io_buf);
+		return (0);
+	}
+	/* b_lblkno identifies the file block even for a premapped cluster. */
+	io_buf->b_blkno = extent.device_blkno;
+	io_buf->b_iooffset = dbtob(extent.device_blkno);
+	io_buf->b_fsprivate1 = io_buf->b_iodone;
+	io_buf->b_iodone = erofs_read_done;
+	BO_STRATEGY(extent.device_bufobj, io_buf);
+	return (0);
 }
 
 /* No dirty writeback on last ref release, so inactive is a no-op. */
@@ -303,11 +398,12 @@ erofs_setattr(struct vop_setattr_args *ap)
 }
 
 static int
-erofs_read(struct vop_read_args *ap)
+erofs_read(struct vop_read_args *read_args)
 {
-	switch (ap->a_vp->v_type) {
+	switch (read_args->a_vp->v_type) {
 	case VREG:
-		return (erofs_read_file(ap->a_vp, ap->a_uio));
+		return (erofs_read_file(read_args->a_vp, read_args->a_uio,
+		    read_args->a_ioflag));
 	case VDIR:
 		return (EISDIR);
 	default:
@@ -315,16 +411,110 @@ erofs_read(struct vop_read_args *ap)
 	}
 }
 
-static int
-erofs_getpages(struct vop_getpages_args *ap)
+static daddr_t
+erofs_pager_lbn(struct vnode *file_vnode __unused, vm_ooffset_t file_offset)
 {
-	struct vnode *vp;
+	return (file_offset >> PAGE_SHIFT);
+}
 
-	vp = ap->a_vp;
-	if (erofs_inode_is_data_compressed(VTOE(vp)->datalayout))
-		return (z_erofs_getpages(vp, ap->a_m, ap->a_count,
-		    ap->a_rbehind, ap->a_rahead));
-	return (vnode_pager_local_getpages(ap));
+static int
+erofs_pager_bsize(struct vnode *file_vnode __unused, daddr_t file_lbn __unused,
+    long *size)
+{
+	*size = PAGE_SIZE;
+	return (0);
+}
+
+/* Read the image directly while the caller owns the exclusive page busy. */
+static int
+erofs_getpage_raw(struct vnode *file_vnode, vm_page_t page)
+{
+	struct erofs_inode *vi;
+	struct sf_buf *page_mapping;
+	erofs_off_t file_offset;
+	size_t file_bytes;
+	void *file_data;
+	char *page_addr;
+	int error;
+
+	vi = VTOE(file_vnode);
+	file_offset = IDX_TO_OFF(page->pindex);
+	if (file_offset >= vi->size)
+		return (VM_PAGER_BAD);
+	file_bytes = MIN(vi->size - file_offset, PAGE_SIZE);
+	error = erofs_read_data(MTOE(file_vnode->v_mount), vi, file_offset,
+	    file_bytes, &file_data);
+	if (error != 0)
+		return (VM_PAGER_ERROR);
+	page_mapping = sf_buf_alloc(page, 0);
+	page_addr = (char *)sf_buf_kva(page_mapping);
+	memcpy(page_addr, file_data, file_bytes);
+	bzero(page_addr + file_bytes, PAGE_SIZE - file_bytes);
+	sf_buf_free(page_mapping);
+	erofs_brelse(file_data);
+	vm_page_valid(page);
+	VM_CNT_INC(v_vnodein);
+	VM_CNT_INC(v_vnodepgsin);
+	return (VM_PAGER_OK);
+}
+
+static int
+erofs_getpages(struct vop_getpages_args *getpages_args)
+{
+	struct erofs_vmio_extent extent;
+	struct vnode *file_vnode;
+	vm_page_t *pages;
+	int error, page_slot, prefix_slots, scan_slot;
+
+	file_vnode = getpages_args->a_vp;
+	if (VN_IS_DOOMED(file_vnode))
+		return (VM_PAGER_BAD);
+	if (erofs_inode_is_data_compressed(VTOE(file_vnode)->datalayout))
+		return (z_erofs_getpages(file_vnode, getpages_args->a_m,
+		    getpages_args->a_count, getpages_args->a_rbehind,
+		    getpages_args->a_rahead));
+	if (getpages_args->a_rbehind != NULL)
+		*getpages_args->a_rbehind = 0;
+	if (getpages_args->a_rahead != NULL)
+		*getpages_args->a_rahead = 0;
+	pages = getpages_args->a_m;
+	error = erofs_vmio_map(file_vnode, pages[0]->pindex, &extent);
+	page_slot = 0;
+	if (error == 0) {
+		prefix_slots = MIN((size_t)getpages_args->a_count,
+		    extent.mapped_bytes / PAGE_SIZE);
+		/* A sendfile array may have a bogus page at the split. */
+		while (pages[prefix_slots - 1] == bogus_page)
+			prefix_slots--;
+		error = vfs_bio_getpages(file_vnode, pages, prefix_slots, NULL,
+		    NULL, erofs_pager_lbn, erofs_pager_bsize);
+		if (error != VM_PAGER_OK)
+			return (error);
+		page_slot = prefix_slots;
+	} else {
+		if (error != EOPNOTSUPP)
+			return (VM_PAGER_ERROR);
+		/*
+		 * The only VMIO range is a prefix.  With an unsupported first
+		 * page the old pager can read this request with VOP_READ.
+		 * Its fallback loop does not skip sendfile's bogus pages.
+		 */
+		for (scan_slot = 0; scan_slot < getpages_args->a_count;
+		    scan_slot++) {
+			if (pages[scan_slot] == bogus_page)
+				break;
+		}
+		if (scan_slot == getpages_args->a_count)
+			return (vnode_pager_local_getpages(getpages_args));
+	}
+	for (; page_slot < getpages_args->a_count; page_slot++) {
+		if (pages[page_slot] == bogus_page)
+			continue;
+		error = erofs_getpage_raw(file_vnode, pages[page_slot]);
+		if (error != VM_PAGER_OK)
+			return (error);
+	}
+	return (VM_PAGER_OK);
 }
 
 static int
@@ -619,6 +809,7 @@ struct vop_vector erofs_vnodeops = {
 	.vop_open = erofs_open,
 	.vop_read = erofs_read,
 	.vop_bmap = erofs_bmap,
+	.vop_strategy = erofs_strategy,
 	.vop_ioctl = erofs_ioctl,
 	.vop_getpages = erofs_getpages,
 

@@ -616,7 +616,15 @@ int erofs_read_data_readahead(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 uint64_t erofs_dir_ra_bytes(struct erofs_sb_info *sbi);
 int erofs_set_dir_ra_bytes(struct erofs_sb_info *sbi, uint64_t value);
 void erofs_record_dir_readahead(struct erofs_sb_info *sbi, unsigned int blocks);
-int erofs_read_file(struct vnode *vp, struct uio *uio);
+/* A physically contiguous run of complete, page-sized file blocks. */
+struct erofs_vmio_extent {
+	struct bufobj *device_bufobj;
+	daddr_t device_blkno;
+	size_t mapped_bytes;
+};
+int erofs_vmio_map(struct vnode *file_vnode, daddr_t file_lbn,
+    struct erofs_vmio_extent *extent);
+int erofs_read_file(struct vnode *file_vnode, struct uio *uio, int ioflag);
 int erofs_file_llseek(struct vnode *vp, off_t *offset, bool seek_data);
 int erofs_readlink_target(struct vnode *vp, struct uio *uio);
 
