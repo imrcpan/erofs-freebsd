@@ -1015,7 +1015,7 @@ int
 erofs_read_file(struct vnode *file_vnode, struct uio *uio, int ioflag)
 {
 	struct erofs_vmio_extent extent;
-	erofs_off_t extent_end;
+	erofs_off_t extent_end, file_size;
 	daddr_t file_lbn;
 	int error;
 
@@ -1024,7 +1024,8 @@ erofs_read_file(struct vnode *file_vnode, struct uio *uio, int ioflag)
 	    uio->uio_segflg == UIO_SYSSPACE)
 		return (erofs_read_uio(file_vnode, uio));
 
-	while (uio->uio_resid > 0) {
+	file_size = VTOE(file_vnode)->size;
+	while (uio->uio_resid > 0 && (erofs_off_t)uio->uio_offset < file_size) {
 		file_lbn = uio->uio_offset >> PAGE_SHIFT;
 		error = erofs_vmio_map(file_vnode, file_lbn, &extent);
 		if (error == EOPNOTSUPP)
