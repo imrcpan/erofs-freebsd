@@ -143,6 +143,7 @@ static const char *erofs_opts[] = {
 	"export",
 	"from",
 	"dir_ra_bytes",
+	"read_buffer_size",
 	"directio",
 	"cache_strategy",
 	"sync_decompress",
@@ -203,6 +204,47 @@ invalid:
 overflow:
 	vfs_mount_error(mp, "erofs: fsoffset value is too large");
 	return (ERANGE);
+}
+
+#define EROFS_DEFAULT_READ_BUFFER_SIZE (16 * 1024)
+
+static int
+erofs_parse_read_buffer_size(struct mount *mp, uint32_t *sizep)
+{
+	static const char *const sizes[] = {
+		"4k",
+		"8k",
+		"16k",
+		"32k",
+		"64k",
+		"128k",
+		"256k",
+		"512k",
+	};
+	char *value;
+	u_int i;
+	int error, len;
+
+	*sizep = 0;
+	error = vfs_getopt(mp->mnt_optnew, "read_buffer_size", (void **)&value,
+	    &len);
+	if (error == ENOENT)
+		return (0);
+	if (error != 0)
+		return (error);
+	if (value != NULL) {
+		for (i = 0; i < nitems(sizes); i++) {
+			if (len == strlen(sizes[i]) + 1 &&
+			    strncasecmp(value, sizes[i], len) == 0) {
+				*sizep = (4U * 1024) << i;
+				return (0);
+			}
+		}
+	}
+	vfs_mount_error(mp,
+	    "erofs: read_buffer_size must be 4k, 8k, 16k, 32k, 64k, "
+	    "128k, 256k, or 512k");
+	return (EINVAL);
 }
 
 static int
@@ -1233,11 +1275,13 @@ erofs_read_superblock(struct erofs_sb_info *sbi, struct erofs_super_block *dsb)
 static int
 erofs_mountfs(struct erofs_device_info *primary, struct mount *mp,
     const struct erofs_device_arg *args, unsigned int arg_count,
-    bool xattr_user_enabled, bool acl_enabled, bool directio_enabled)
+    bool xattr_user_enabled, bool acl_enabled, bool directio_enabled,
+    uint32_t requested_size)
 {
 	struct erofs_sb_info *sbi;
 	struct erofs_inode root;
 	struct erofs_super_block dsb;
+	uint32_t size;
 	bool cache_present, sync_present, priority_present;
 	int cleanup_error, error;
 
@@ -1276,6 +1320,29 @@ erofs_mountfs(struct erofs_device_info *primary, struct mount *mp,
 	error = erofs_scan_devices(sbi, &dsb, args, arg_count);
 	if (error != 0)
 		goto fail;
+
+	/* Set the file block geometry before publishing the mount. */
+	size = requested_size != 0 ? requested_size :
+				     EROFS_DEFAULT_READ_BUFFER_SIZE;
+	if (requested_size > maxbcachebuf) {
+		vfs_mount_error(mp,
+		    "erofs: read_buffer_size=%uk exceeds vfs.maxbcachebuf=%d",
+		    requested_size / 1024, maxbcachebuf);
+		error = EOPNOTSUPP;
+		goto fail;
+	}
+	if (size >= PAGE_SIZE && sbi->block_size == PAGE_SIZE &&
+	    sbi->extra_devices == 0 &&
+	    sbi->dif0.source_kind == EROFS_SOURCE_BLOCK &&
+	    mp->mnt_iosize_max >= size)
+		sbi->read_buffer_size = size;
+	else if (requested_size != 0) {
+		vfs_mount_error(mp,
+		    "erofs: read_buffer_size=%uk is unsupported on this mount",
+		    requested_size / 1024);
+		error = EOPNOTSUPP;
+		goto fail;
+	}
 
 	error = erofs_init_packed_inode(sbi);
 	if (error != 0)
@@ -1331,6 +1398,7 @@ erofs_mount(struct mount *mp)
 	struct erofs_sb_info_opts next_opt;
 	char *fspec;
 	uint64_t fsoffset, new_dir_ra;
+	uint32_t requested_size;
 	unsigned int next_sync;
 	unsigned int arg_count;
 	bool directio_enabled, directio_present;
@@ -1341,12 +1409,21 @@ erofs_mount(struct mount *mp)
 	MNT_ILOCK(mp);
 	mp->mnt_flag |= MNT_RDONLY;
 	MNT_IUNLOCK(mp);
+	error = erofs_parse_read_buffer_size(mp, &requested_size);
+	if (error != 0)
+		return (error);
 	if (mp->mnt_flag & MNT_UPDATE) {
 		sbi = MTOE(mp);
 		if (sbi == NULL)
 			return (EINVAL);
 		if (mp->mnt_flag & MNT_RELOAD)
 			return (EOPNOTSUPP);
+		if (requested_size != 0 &&
+		    requested_size != sbi->read_buffer_size) {
+			vfs_mount_error(mp,
+			    "erofs: read_buffer_size cannot be changed on update");
+			return (EOPNOTSUPP);
+		}
 		error = erofs_reject_device_update(mp);
 		if (error != 0)
 			return (error);
@@ -1457,7 +1534,7 @@ erofs_mount(struct mount *mp)
 	primary.fsoff = fsoffset;
 	erofs_update_iosize_max(mp, &primary);
 	error = erofs_mountfs(&primary, mp, args, arg_count, xattr_user_enabled,
-	    acl_enabled, directio_enabled);
+	    acl_enabled, directio_enabled, requested_size);
 	if (error != 0)
 		erofs_release_device_info(&primary);
 out_args:
@@ -1488,7 +1565,8 @@ erofs_statfs(struct mount *mp, struct statfs *sbp)
 
 	sbi = MTOE(mp);
 	sbp->f_bsize = sbi->block_size;
-	sbp->f_iosize = sbi->block_size;
+	sbp->f_iosize = sbi->read_buffer_size != 0 ? sbi->read_buffer_size :
+						     sbi->block_size;
 	sbp->f_blocks = sbi->total_blocks;
 	sbp->f_bfree = 0;
 	sbp->f_bavail = 0;

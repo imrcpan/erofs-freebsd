@@ -25,7 +25,7 @@
 .\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
 .\" SUCH DAMAGE.
 .\"
-.Dd October 19, 2026
+.Dd November 26, 2026
 .Dt EROFS 4
 .Os
 .Sh NAME
@@ -149,6 +149,24 @@ device.
 If the image has a device table and no external devices are given, the
 additional devices are read from the primary device at the addresses recorded
 in the table.
+.It Cm read_buffer_size Ns = Ns Ar size
+Set the size of an individual file buffer for uncompressed regular file data.
+The supported sizes are 4, 8, 16, 32, 64, 128, 256, and 512 KiB.
+Append either
+.Cm k
+or
+.Cm K
+to the number, for example
+.Cm read_buffer_size=16k .
+Sequential reads can combine several buffers into one device request.
+This option requires a single disk provider, an image block size equal to the
+system page size, and a buffer size between the page size and the maximum I/O
+size of the mount.
+The size must also fit within the buffer cache limit given by the
+.Va vfs.maxbcachebuf
+loader tunable, in bytes.
+The default is 16 KiB when supported, or the image block size otherwise.
+Unmount and mount the file system again to change this value.
 .It Cm dir_ra_bytes Ns = Ns Ar bytes
 How much of a directory is read ahead when it is scanned.
 The value must be 0, which turns readahead off, or a multiple of the block size

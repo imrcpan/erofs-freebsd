@@ -118,7 +118,7 @@ static int
 erofs_bmap(struct vop_bmap_args *bmap_args)
 {
 	struct erofs_vmio_extent extent;
-	size_t max_io_bytes, run_pages;
+	size_t bufsize, max_io_bytes, run_blocks;
 	int error;
 
 	if (bmap_args->a_bop != NULL)
@@ -137,11 +137,12 @@ erofs_bmap(struct vop_bmap_args *bmap_args)
 	if (bmap_args->a_bnp != NULL)
 		*bmap_args->a_bnp = extent.device_blkno;
 	if (bmap_args->a_runp != NULL) {
+		bufsize = erofs_vmio_bufsize(bmap_args->a_vp);
 		max_io_bytes = bmap_args->a_vp->v_mount->mnt_iosize_max;
-		run_pages = MIN(extent.mapped_bytes, max_io_bytes) / PAGE_SIZE;
+		run_blocks = MIN(extent.mapped_bytes, max_io_bytes) / bufsize;
 
 		/* The forward run excludes the current block. */
-		*bmap_args->a_runp = run_pages - 1;
+		*bmap_args->a_runp = run_blocks - 1;
 	}
 	return (0);
 }
@@ -203,7 +204,9 @@ erofs_strategy(struct vop_strategy_args *strategy_args)
 		    &extent);
 		if (error == 0 &&
 		    (io_buf->b_bcount <= 0 ||
-			(io_buf->b_bcount & PAGE_MASK) != 0 ||
+			(io_buf->b_bcount &
+			    (erofs_vmio_bufsize(strategy_args->a_vp) - 1)) !=
+			    0 ||
 			(size_t)io_buf->b_bcount > extent.mapped_bytes))
 			error = EIO;
 	}
@@ -412,16 +415,16 @@ erofs_read(struct vop_read_args *read_args)
 }
 
 static daddr_t
-erofs_pager_lbn(struct vnode *file_vnode __unused, vm_ooffset_t file_offset)
+erofs_pager_lbn(struct vnode *file_vnode, vm_ooffset_t file_offset)
 {
-	return (file_offset >> PAGE_SHIFT);
+	return (file_offset / erofs_vmio_bufsize(file_vnode));
 }
 
 static int
-erofs_pager_bsize(struct vnode *file_vnode __unused, daddr_t file_lbn __unused,
+erofs_pager_bsize(struct vnode *file_vnode, daddr_t file_lbn __unused,
     long *size)
 {
-	*size = PAGE_SIZE;
+	*size = erofs_vmio_bufsize(file_vnode);
 	return (0);
 }
 
@@ -464,6 +467,8 @@ erofs_getpages(struct vop_getpages_args *getpages_args)
 	struct erofs_vmio_extent extent;
 	struct vnode *file_vnode;
 	vm_page_t *pages;
+	vm_ooffset_t first_offset;
+	size_t offset_in_buf;
 	int error, page_slot, prefix_slots, scan_slot;
 
 	file_vnode = getpages_args->a_vp;
@@ -478,18 +483,26 @@ erofs_getpages(struct vop_getpages_args *getpages_args)
 	if (getpages_args->a_rahead != NULL)
 		*getpages_args->a_rahead = 0;
 	pages = getpages_args->a_m;
-	error = erofs_vmio_map(file_vnode, pages[0]->pindex, &extent);
+	first_offset = IDX_TO_OFF(pages[0]->pindex);
+	error = erofs_vmio_map(file_vnode,
+	    erofs_pager_lbn(file_vnode, first_offset), &extent);
 	page_slot = 0;
 	if (error == 0) {
+		offset_in_buf = first_offset &
+		    (erofs_vmio_bufsize(file_vnode) - 1);
 		prefix_slots = MIN((size_t)getpages_args->a_count,
-		    extent.mapped_bytes / PAGE_SIZE);
+		    atop(extent.mapped_bytes - offset_in_buf));
 		/* A sendfile array may have a bogus page at the split. */
-		while (pages[prefix_slots - 1] == bogus_page)
+		while (
+		    prefix_slots > 0 && pages[prefix_slots - 1] == bogus_page)
 			prefix_slots--;
-		error = vfs_bio_getpages(file_vnode, pages, prefix_slots, NULL,
-		    NULL, erofs_pager_lbn, erofs_pager_bsize);
-		if (error != VM_PAGER_OK)
-			return (error);
+		if (prefix_slots > 0) {
+			error = vfs_bio_getpages(file_vnode, pages,
+			    prefix_slots, NULL, NULL, erofs_pager_lbn,
+			    erofs_pager_bsize);
+			if (error != VM_PAGER_OK)
+				return (error);
+		}
 		page_slot = prefix_slots;
 	} else {
 		if (error != EOPNOTSUPP)

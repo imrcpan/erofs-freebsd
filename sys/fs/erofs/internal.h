@@ -370,6 +370,8 @@ struct erofs_sb_info {
 	bool control_closing;
 
 	uint32_t block_size;
+	uint32_t
+	    read_buffer_size; /* File VMIO size, or 0 for native geometry. */
 	uint32_t sb_size;
 	uint8_t blkszbits;
 	uint32_t meta_blkaddr;
@@ -618,7 +620,17 @@ int erofs_read_data_readahead(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 uint64_t erofs_dir_ra_bytes(struct erofs_sb_info *sbi);
 int erofs_set_dir_ra_bytes(struct erofs_sb_info *sbi, uint64_t value);
 void erofs_record_dir_readahead(struct erofs_sb_info *sbi, unsigned int blocks);
-/* A physically contiguous run of complete, page-sized file blocks. */
+
+static inline size_t
+erofs_vmio_bufsize(const struct vnode *vp)
+{
+	uint32_t size;
+
+	size = MTOE(vp->v_mount)->read_buffer_size;
+	return (size != 0 ? size : PAGE_SIZE);
+}
+
+/* A physically contiguous run of complete file buffers. */
 struct erofs_vmio_extent {
 	struct bufobj *device_bufobj;
 	daddr_t device_blkno;

@@ -598,13 +598,14 @@ erofs_vmio_map(struct vnode *file_vnode, daddr_t file_lbn,
 	struct erofs_map_dev device_map;
 	erofs_off_t device_offset, file_offset;
 	erofs_blk_t device_blocks;
-	size_t mapped_bytes;
+	size_t bufsize, mapped_bytes;
 	int error;
 
+	bufsize = erofs_vmio_bufsize(file_vnode);
 	if (file_vnode->v_type != VREG || file_vnode->v_object == NULL ||
-	    file_vnode->v_bufobj.bo_bsize != PAGE_SIZE ||
-	    file_vnode->v_mount->mnt_stat.f_iosize != PAGE_SIZE ||
-	    file_vnode->v_mount->mnt_iosize_max < PAGE_SIZE)
+	    file_vnode->v_bufobj.bo_bsize != bufsize ||
+	    file_vnode->v_mount->mnt_stat.f_iosize != bufsize ||
+	    file_vnode->v_mount->mnt_iosize_max < bufsize)
 		return (EOPNOTSUPP);
 	sbi = MTOE(file_vnode->v_mount);
 	vi = VTOE(file_vnode);
@@ -613,9 +614,9 @@ erofs_vmio_map(struct vnode *file_vnode, daddr_t file_lbn,
 	    (vi->datalayout != EROFS_INODE_FLAT_PLAIN &&
 		vi->datalayout != EROFS_INODE_FLAT_INLINE))
 		return (EOPNOTSUPP);
-	if (file_lbn < 0 || (uint64_t)file_lbn >= (vi->size >> PAGE_SHIFT))
+	if (file_lbn < 0 || (uint64_t)file_lbn >= vi->size / bufsize)
 		return (EOPNOTSUPP);
-	file_offset = (uint64_t)file_lbn << PAGE_SHIFT;
+	file_offset = (uint64_t)file_lbn * bufsize;
 	file_map = (struct erofs_map_blocks) { .m_la = file_offset };
 	error = erofs_map_blocks_flatmode(sbi, vi, &file_map);
 	if (error != 0)
@@ -623,8 +624,9 @@ erofs_vmio_map(struct vnode *file_vnode, daddr_t file_lbn,
 	if (file_map.m_flags != EROFS_MAP_MAPPED)
 		return (EOPNOTSUPP);
 	/* flatmode stops at inline_tail_start, even for block-aligned EOF. */
-	mapped_bytes = rounddown2(MIN(file_map.m_llen, (uint64_t)SIZE_MAX),
-	    (uint64_t)PAGE_SIZE);
+	mapped_bytes = MIN(MIN(file_map.m_llen, vi->size - file_offset),
+	    (uint64_t)SIZE_MAX);
+	mapped_bytes = rounddown2(mapped_bytes, bufsize);
 	if (mapped_bytes == 0)
 		return (EOPNOTSUPP);
 	error = erofs_map_physical(sbi, file_map.m_deviceid, file_map.m_pa,
@@ -998,59 +1000,60 @@ erofs_read_uio(struct vnode *vp, struct uio *uio)
 
 static int
 erofs_get_vmio_buf(struct vnode *file_vnode, const struct uio *uio,
-    erofs_off_t extent_end, int ioflag, struct buf **file_bufp)
+    erofs_off_t extent_end, size_t bufsize, int ioflag, struct buf **file_bufp)
 {
 	struct mount *file_mount;
 	uint64_t span_bytes;
 	daddr_t file_lbn;
 	long demand_bytes;
+	int seqcount;
 
 	file_mount = file_vnode->v_mount;
-	file_lbn = uio->uio_offset >> PAGE_SHIFT;
+	file_lbn = uio->uio_offset / bufsize;
 	if ((file_mount->mnt_flag & MNT_NOCLUSTERR) != 0)
-		return (bread_gb(file_vnode, file_lbn, PAGE_SIZE, NOCRED,
+		return (bread_gb(file_vnode, file_lbn, bufsize, NOCRED,
 		    GB_UNMAPPED, file_bufp));
 
 	/* cluster_read() measures demand from the start of the file block. */
 	span_bytes = extent_end - uio->uio_offset;
 	span_bytes = MIN(span_bytes, (uint64_t)uio->uio_resid);
-	span_bytes += (uio->uio_offset & PAGE_MASK);
+	span_bytes += (uio->uio_offset & (bufsize - 1));
 	demand_bytes = MIN(span_bytes, (uint64_t)file_mount->mnt_iosize_max);
-	return (
-	    cluster_read(file_vnode, extent_end, file_lbn, PAGE_SIZE, NOCRED,
-		demand_bytes, ioflag >> IO_SEQSHIFT, GB_UNMAPPED, file_bufp));
+	/* Express the previous page-sized window in file buffers. */
+	seqcount = howmany((unsigned)ioflag >> IO_SEQSHIFT,
+	    bufsize / PAGE_SIZE);
+	return (cluster_read(file_vnode, extent_end, file_lbn, bufsize, NOCRED,
+	    demand_bytes, seqcount, GB_UNMAPPED, file_bufp));
 }
 
 static int
 erofs_read_vmio_extent(struct vnode *file_vnode, struct uio *uio,
-    erofs_off_t extent_end, int ioflag)
+    erofs_off_t extent_end, size_t bufsize, int ioflag)
 {
 	struct buf *file_buf;
-	size_t offset_in_page, copy_bytes;
+	size_t offset_in_buf, copy_bytes;
 	int error;
 
 	while (
 	    uio->uio_resid > 0 && (erofs_off_t)uio->uio_offset < extent_end) {
-		error = erofs_get_vmio_buf(file_vnode, uio, extent_end, ioflag,
-		    &file_buf);
+		error = erofs_get_vmio_buf(file_vnode, uio, extent_end, bufsize,
+		    ioflag, &file_buf);
 		if (error != 0)
 			return (error);
-		if (file_buf->b_resid != 0 || file_buf->b_bcount != PAGE_SIZE)
+		offset_in_buf = uio->uio_offset & (bufsize - 1);
+		copy_bytes = MIN((size_t)uio->uio_resid,
+		    bufsize - offset_in_buf);
+		if (file_buf->b_resid != 0 || file_buf->b_bcount != bufsize ||
+		    (file_buf->b_offset & PAGE_MASK) != 0)
 			error = EIO;
-		else {
-			offset_in_page = uio->uio_offset & PAGE_MASK;
-			copy_bytes = MIN((size_t)uio->uio_resid,
-			    PAGE_SIZE - offset_in_page);
-			if (buf_mapped(file_buf))
-				error = uiomove(file_buf->b_data +
-					offset_in_page,
-				    copy_bytes, uio);
-			else
-				error = vn_io_fault_pgmove(file_buf->b_pages,
-				    offset_in_page +
-					(file_buf->b_offset & PAGE_MASK),
-				    (int)copy_bytes, uio);
-		}
+		else if (buf_mapped(file_buf))
+			error = uiomove(file_buf->b_data + offset_in_buf,
+			    copy_bytes, uio);
+		else if ((size_t)file_buf->b_npages < atop(bufsize))
+			error = EIO;
+		else
+			error = vn_io_fault_pgmove(file_buf->b_pages,
+			    offset_in_buf, (int)copy_bytes, uio);
 		brelse(file_buf);
 		if (error != 0)
 			return (error);
@@ -1064,6 +1067,7 @@ erofs_read_file(struct vnode *file_vnode, struct uio *uio, int ioflag)
 {
 	struct erofs_vmio_extent extent;
 	erofs_off_t extent_end, file_size;
+	size_t bufsize;
 	daddr_t file_lbn;
 	int error;
 
@@ -1072,19 +1076,20 @@ erofs_read_file(struct vnode *file_vnode, struct uio *uio, int ioflag)
 	    uio->uio_segflg == UIO_SYSSPACE)
 		return (erofs_read_uio(file_vnode, uio));
 
+	bufsize = erofs_vmio_bufsize(file_vnode);
 	file_size = VTOE(file_vnode)->size;
 	while (uio->uio_resid > 0 && (erofs_off_t)uio->uio_offset < file_size) {
-		file_lbn = uio->uio_offset >> PAGE_SHIFT;
+		file_lbn = uio->uio_offset / bufsize;
 		error = erofs_vmio_map(file_vnode, file_lbn, &extent);
 		if (error == EOPNOTSUPP)
 			return (erofs_read_uio(file_vnode, uio));
 		if (error != 0)
 			return (error);
 
-		extent_end = ((erofs_off_t)file_lbn << PAGE_SHIFT) +
+		extent_end = ((erofs_off_t)file_lbn * bufsize) +
 		    extent.mapped_bytes;
 		error = erofs_read_vmio_extent(file_vnode, uio, extent_end,
-		    ioflag);
+		    bufsize, ioflag);
 		if (error != 0)
 			return (error);
 	}
