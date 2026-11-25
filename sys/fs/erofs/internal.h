@@ -604,6 +604,8 @@ int erofs_read_physical(struct erofs_sb_info *sbi, unsigned int device_id,
 int erofs_read_physical_bulk(struct erofs_sb_info *sbi, unsigned int device_id,
     erofs_off_t off, size_t len, bool sequential, struct erofs_buf *buf);
 void erofs_brelse(void *buf);
+int erofs_read_inode_header(struct erofs_sb_info *sbi, erofs_nid_t nid,
+    erofs_off_t off, struct erofs_buf *buf);
 int erofs_read_metadata_range(struct erofs_sb_info *sbi, erofs_nid_t nid,
     erofs_off_t off, size_t len, struct erofs_buf *buf);
 /* Logical mapping and file data. */

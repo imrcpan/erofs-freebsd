@@ -188,6 +188,54 @@ erofs_brelse(void *buf)
 	free(buf, M_EROFS);
 }
 
+/* Read the first inode header; speculate one block only on a cache miss. */
+int
+erofs_read_inode_header(struct erofs_sb_info *sbi, erofs_nid_t nid,
+    erofs_off_t off, struct erofs_buf *buf)
+{
+	struct erofs_device_info *device;
+	erofs_off_t block_off, device_off, window_bytes;
+	daddr_t next_block;
+	void *data;
+	int block_size, error;
+
+	device = &sbi->dif0;
+	block_size = sbi->block_size;
+	if (erofs_nid_in_metabox(nid) || sbi->extra_devices != 0 ||
+	    !erofs_source_is_open(device) ||
+	    device->source_kind != EROFS_SOURCE_BLOCK ||
+	    block_size != PAGE_SIZE || device->sectorsize == 0 ||
+	    device->sectorsize > (unsigned)block_size ||
+	    (device->fsoff & (block_size - 1)) != 0 || device->blocks < 2 ||
+	    (off >> sbi->blkszbits) >= device->blocks - 1)
+		goto demand_only;
+	block_off = rounddown2(off, (erofs_off_t)block_size);
+	window_bytes = 2 * (erofs_off_t)block_size;
+	if (off - block_off > block_size - sizeof(struct erofs_inode_compact) ||
+	    __builtin_add_overflow(device->fsoff, block_off, &device_off) ||
+	    device_off > (uint64_t)INT64_MAX + 1 - window_bytes ||
+	    device_off > device->mediasize ||
+	    window_bytes > device->mediasize - device_off)
+		goto demand_only;
+
+	/* A cache hint may race; the demand read always rechecks the buffer. */
+	if (incore(&device->devvp->v_bufobj, btodb(device_off)) != NULL)
+		goto demand_only;
+	next_block = btodb(device_off + block_size);
+	error = erofs_bread_device(sbi, device, device->blocks, off,
+	    sizeof(struct erofs_inode_compact), &next_block, &block_size, 1,
+	    &data);
+	if (error != 0)
+		return (error);
+	buf->data = data;
+	buf->release = erofs_brelse;
+	return (0);
+
+demand_only:
+	return (erofs_read_metadata_range(sbi, nid, off,
+	    sizeof(struct erofs_inode_compact), buf));
+}
+
 /* Read inode metadata from either the primary image or the metabox file. */
 int
 erofs_read_metadata_range(struct erofs_sb_info *sbi, erofs_nid_t nid,

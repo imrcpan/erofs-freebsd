@@ -197,8 +197,7 @@ erofs_read_inode(struct erofs_sb_info *sbi, erofs_nid_t nid,
 	off = erofs_iloc(sbi, nid);
 	EROFS_TRACE_FILL_INODE(nid, off >> sbi->blkszbits,
 	    off & (sbi->block_size - 1));
-	err = erofs_read_metadata_range(sbi, nid, off,
-	    sizeof(struct erofs_inode_compact), &buf);
+	err = erofs_read_inode_header(sbi, nid, off, &buf);
 	if (err != 0)
 		return (err);
 
