@@ -960,16 +960,17 @@ erofs_get_vmio_buf(struct vnode *file_vnode, const struct uio *uio,
 	file_mount = file_vnode->v_mount;
 	file_lbn = uio->uio_offset >> PAGE_SHIFT;
 	if ((file_mount->mnt_flag & MNT_NOCLUSTERR) != 0)
-		return (
-		    bread(file_vnode, file_lbn, PAGE_SIZE, NOCRED, file_bufp));
+		return (bread_gb(file_vnode, file_lbn, PAGE_SIZE, NOCRED,
+		    GB_UNMAPPED, file_bufp));
 
 	/* cluster_read() measures demand from the start of the file block. */
 	span_bytes = extent_end - uio->uio_offset;
 	span_bytes = MIN(span_bytes, (uint64_t)uio->uio_resid);
 	span_bytes += (uio->uio_offset & PAGE_MASK);
 	demand_bytes = MIN(span_bytes, (uint64_t)file_mount->mnt_iosize_max);
-	return (cluster_read(file_vnode, extent_end, file_lbn, PAGE_SIZE,
-	    NOCRED, demand_bytes, ioflag >> IO_SEQSHIFT, 0, file_bufp));
+	return (
+	    cluster_read(file_vnode, extent_end, file_lbn, PAGE_SIZE, NOCRED,
+		demand_bytes, ioflag >> IO_SEQSHIFT, GB_UNMAPPED, file_bufp));
 }
 
 static int
@@ -992,8 +993,15 @@ erofs_read_vmio_extent(struct vnode *file_vnode, struct uio *uio,
 			offset_in_page = uio->uio_offset & PAGE_MASK;
 			copy_bytes = MIN((size_t)uio->uio_resid,
 			    PAGE_SIZE - offset_in_page);
-			error = uiomove(file_buf->b_data + offset_in_page,
-			    copy_bytes, uio);
+			if (buf_mapped(file_buf))
+				error = uiomove(file_buf->b_data +
+					offset_in_page,
+				    copy_bytes, uio);
+			else
+				error = vn_io_fault_pgmove(file_buf->b_pages,
+				    offset_in_page +
+					(file_buf->b_offset & PAGE_MASK),
+				    (int)copy_bytes, uio);
 		}
 		brelse(file_buf);
 		if (error != 0)
