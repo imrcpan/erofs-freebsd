@@ -368,6 +368,7 @@ struct erofs_sb_info {
 	bool control_initialized;
 	bool sysctl_registered;
 	bool control_closing;
+	bool use_16k_file_buffers;
 
 	uint32_t block_size;
 	uint32_t sb_size;
@@ -618,7 +619,17 @@ int erofs_read_data_readahead(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 uint64_t erofs_dir_ra_bytes(struct erofs_sb_info *sbi);
 int erofs_set_dir_ra_bytes(struct erofs_sb_info *sbi, uint64_t value);
 void erofs_record_dir_readahead(struct erofs_sb_info *sbi, unsigned int blocks);
-/* A physically contiguous run of complete, page-sized file blocks. */
+
+#define EROFS_FILE_BUFSIZE (16 * 1024)
+
+static inline size_t
+erofs_vmio_bufsize(const struct vnode *vp)
+{
+	return (MTOE(vp->v_mount)->use_16k_file_buffers ? EROFS_FILE_BUFSIZE :
+							  PAGE_SIZE);
+}
+
+/* A physically contiguous run of complete file buffers. */
 struct erofs_vmio_extent {
 	struct bufobj *device_bufobj;
 	daddr_t device_blkno;

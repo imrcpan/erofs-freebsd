@@ -1277,6 +1277,12 @@ erofs_mountfs(struct erofs_device_info *primary, struct mount *mp,
 	if (error != 0)
 		goto fail;
 
+	sbi->use_16k_file_buffers = EROFS_FILE_BUFSIZE >= PAGE_SIZE &&
+	    EROFS_FILE_BUFSIZE <= maxbcachebuf &&
+	    sbi->block_size == PAGE_SIZE && sbi->extra_devices == 0 &&
+	    sbi->dif0.source_kind == EROFS_SOURCE_BLOCK &&
+	    mp->mnt_iosize_max >= EROFS_FILE_BUFSIZE;
+
 	error = erofs_init_packed_inode(sbi);
 	if (error != 0)
 		goto fail;
@@ -1488,7 +1494,8 @@ erofs_statfs(struct mount *mp, struct statfs *sbp)
 
 	sbi = MTOE(mp);
 	sbp->f_bsize = sbi->block_size;
-	sbp->f_iosize = sbi->block_size;
+	sbp->f_iosize = sbi->use_16k_file_buffers ? EROFS_FILE_BUFSIZE :
+						    sbi->block_size;
 	sbp->f_blocks = sbi->total_blocks;
 	sbp->f_bfree = 0;
 	sbp->f_bavail = 0;
