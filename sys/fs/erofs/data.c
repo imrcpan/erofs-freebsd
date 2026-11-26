@@ -8,14 +8,19 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/_maxphys.h>
+#include <sys/bio.h>
 #include <sys/buf.h>
 #include <sys/libkern.h>
 #include <sys/limits.h>
 #include <sys/malloc.h>
+#include <sys/proc.h>
+#include <sys/rwlock.h>
 #include <sys/uio.h>
 #include <sys/vnode.h>
 
 #include <vm/vm.h>
+#include <vm/vm_object.h>
+#include <vm/vm_page.h>
 
 #include <machine/vmparam.h>
 
@@ -193,6 +198,7 @@ int
 erofs_read_inode_header(struct erofs_sb_info *sbi, erofs_nid_t nid,
     erofs_off_t off, struct erofs_buf *buf)
 {
+	struct bufobj *bo;
 	struct erofs_device_info *device;
 	erofs_off_t block_off, device_off, window_bytes;
 	daddr_t next_block;
@@ -219,7 +225,12 @@ erofs_read_inode_header(struct erofs_sb_info *sbi, erofs_nid_t nid,
 		goto demand_only;
 
 	/* A cache hint may race; the demand read always rechecks the buffer. */
-	if (incore(&device->devvp->v_bufobj, btodb(device_off)) != NULL)
+	bo = &device->devvp->v_bufobj;
+	if (incore(bo, btodb(device_off)) != NULL)
+		goto demand_only;
+	/* At 16 KiB, look for a forward scan before fetching a neighbour. */
+	if (sbi->read_buffer_size == 16384 && (block_off == 0 ||
+	    incore(bo, btodb(device_off - block_size)) == NULL))
 		goto demand_only;
 	next_block = btodb(device_off + block_size);
 	error = erofs_bread_device(sbi, device, device->blocks, off,
@@ -913,8 +924,182 @@ erofs_read_data_readahead(struct erofs_sb_info *sbi, struct erofs_inode *vi,
 	return (error);
 }
 
+/* A mapped, clean VMIO miss at exactly one normal device-cache key. */
+static bool
+erofs_pair_child(struct buf *bp, off_t off)
+{
+	return (bp != NULL &&
+	    (bp->b_flags &
+		(B_VMIO | B_CACHE | B_DELWRI | B_INVAL | B_MANAGED | B_RELBUF |
+		    B_NOCACHE)) == B_VMIO &&
+	    (bp->b_vflags & BV_BKGRDINPROG) == 0 &&
+	    (bp->b_ioflags & BIO_ERROR) == 0 && buf_mapped(bp) &&
+	    bp->b_offset == off && bp->b_blkno == btodb(off) &&
+	    bp->b_bcount == PAGE_SIZE && bp->b_bufsize == PAGE_SIZE &&
+	    bp->b_npages == 1);
+}
+
+static void
+erofs_pair_release(struct buf *bp)
+{
+	/* An unfilled non-VMIO header must not be mistaken for a hit. */
+	if (bp != NULL && (bp->b_flags & (B_VMIO | B_CACHE)) == 0)
+		bp->b_flags |= B_INVAL;
+	brelse(bp);
+}
+
 static int
-erofs_read_uio(struct vnode *vp, struct uio *uio)
+erofs_read_demand_pair_locked(struct erofs_sb_info *sbi, erofs_off_t off,
+    void **bufp)
+{
+	struct erofs_device_info *dif = &sbi->dif0;
+	const int len = 2 * PAGE_SIZE;
+	struct buf *bp, *child[2] = { NULL, NULL };
+	struct vnode *vp = dif->devvp;
+	vm_page_t m;
+	erofs_off_t device_off;
+	daddr_t first, second;
+	char *data;
+	int busy, error, i;
+	bool eligible;
+
+	ASSERT_VOP_LOCKED(vp, __func__);
+	error = erofs_device_span(sbi, dif, dif->blocks, off, len, &device_off);
+	if (error != 0)
+		return (error);
+	if (vp->v_object == NULL)
+		return (EJUSTRETURN);
+	first = btodb(device_off);
+	second = btodb(device_off + PAGE_SIZE);
+	/* Instantiate the second mapped header without holding its neighbour.
+	 */
+	bp = getblk(vp, second, PAGE_SIZE, 0, 0, 0);
+	eligible = erofs_pair_child(bp, device_off + PAGE_SIZE);
+	erofs_pair_release(bp);
+	if (!eligible)
+		return (EJUSTRETURN);
+
+	data = malloc(len, M_EROFS, M_WAITOK);
+	error = EJUSTRETURN;
+	busy = 0;
+	child[0] = getblk(vp, first, PAGE_SIZE, 0, 0, 0);
+	if (!erofs_pair_child(child[0], device_off))
+		goto out;
+	/*
+	 * This mount-private read-only vnode uses only PAGE_SIZE device bufs
+	 * after mount. Do not create, remap or wait for its second header.
+	 */
+	child[1] = getblk(vp, second, PAGE_SIZE, 0, 0,
+	    GB_NOCREAT | GB_LOCK_NOWAIT | GB_UNMAPPED);
+	if (!erofs_pair_child(child[1], device_off + PAGE_SIZE) ||
+	    child[0]->b_pages[0] == child[1]->b_pages[0])
+		goto out;
+	for (i = 0; i < 2; i++) {
+		m = child[i]->b_pages[0];
+		if (!vm_page_tryxbusy(m))
+			goto out;
+		busy++;
+		if (m->object != vp->v_object ||
+		    m->pindex != OFF_TO_IDX(device_off + i * PAGE_SIZE) ||
+		    m->dirty != 0 || !vm_page_none_valid(m))
+			goto out;
+	}
+	bp = uma_zalloc(pbuf_zone, M_NOWAIT);
+	if (bp == NULL)
+		goto out;
+	pbgetvp(vp, bp);
+	bp->b_iocmd = BIO_READ;
+	bp->b_data = data;
+	bp->b_lblkno = bp->b_blkno = first;
+	bp->b_offset = bp->b_iooffset = device_off;
+	bp->b_bufsize = bp->b_bcount = bp->b_resid = len;
+	(void)runningbufclaim(bp, len);
+	curthread->td_ru.ru_inblock++;
+	bstrategy(bp);
+	error = bufwait(bp);
+	if (error == 0 && bp->b_resid != 0)
+		error = EIO;
+	pbrelvp(bp);
+	uma_zfree(pbuf_zone, bp);
+	if (error == 0) {
+		/* Publish both halves before releasing either reservation. */
+		for (i = 0; i < 2; i++) {
+			memcpy(child[i]->b_data, data + i * PAGE_SIZE,
+			    PAGE_SIZE);
+			vm_page_valid(child[i]->b_pages[0]);
+			child[i]->b_error = child[i]->b_resid = 0;
+			child[i]->b_flags |= B_CACHE;
+		}
+	}
+out:
+	while (busy != 0)
+		vm_page_xunbusy(child[--busy]->b_pages[0]);
+	erofs_pair_release(child[1]);
+	erofs_pair_release(child[0]);
+	if (error == 0)
+		*bufp = data;
+	else
+		free(data, M_EROFS);
+	return (error);
+}
+
+/* Keep the private device vnode live through the pbuf and cache lookups. */
+static int
+erofs_read_demand_pair(struct erofs_sb_info *sbi, erofs_off_t off, void **bufp)
+{
+	struct vnode *devvp;
+	int error;
+
+	devvp = sbi->dif0.devvp;
+	vn_lock(devvp, LK_SHARED | LK_RETRY);
+	if (VN_IS_DOOMED(devvp))
+		error = ENXIO;
+	else
+		error = erofs_read_demand_pair_locked(sbi, off, bufp);
+	VOP_UNLOCK(devvp);
+	if (error == EJUSTRETURN)
+		return (erofs_read_physical(sbi, 0, off, 2 * PAGE_SIZE, bufp));
+	return (error);
+}
+
+/*
+ * Copy one mapped slice from the normal device buffer without staging it.
+ * Never fault in a user page under its buf lock.  With one iovec covering
+ * len, a failed copyout has not advanced the uio; retry it after brelse().
+ */
+static int
+erofs_read_onebuf(struct erofs_sb_info *sbi, erofs_off_t off, size_t len,
+    struct uio *uio)
+{
+	struct erofs_device_info *dif = &sbi->dif0;
+	struct buf *bp;
+	erofs_off_t device_off;
+	size_t offset;
+	int error;
+
+	error = erofs_device_span(sbi, dif, dif->blocks, off, len, &device_off);
+	if (error != 0)
+		return (error);
+	offset = device_off & PAGE_MASK;
+	error = bread(dif->devvp, btodb(device_off - offset), PAGE_SIZE, NOCRED,
+	    &bp);
+	if (error != 0)
+		return (error);
+	if (!buf_mapped(bp) || bp->b_data == NULL || bp->b_resid < 0 ||
+	    bp->b_resid > bp->b_bcount ||
+	    offset + len > (uintmax_t)(bp->b_bcount - bp->b_resid))
+		error = EIO;
+	else {
+		error = uiomove_nofault(bp->b_data + offset, len, uio);
+		if (error == EFAULT)
+			error = EJUSTRETURN;
+	}
+	brelse(bp);
+	return (error);
+}
+
+static int
+erofs_read_uio(struct vnode *vp, struct uio *uio, bool buffered)
 {
 	struct erofs_buf buf = EROFS_BUF_INITIALIZER;
 	struct erofs_map_blocks map;
@@ -924,6 +1109,7 @@ erofs_read_uio(struct vnode *vp, struct uio *uio)
 	erofs_off_t mapoff, physical;
 	size_t want, chunk;
 	int error;
+	bool demand_pair, onebuf;
 
 	sbi = MTOE(vp->v_mount);
 	vi = VTOE(vp);
@@ -941,6 +1127,18 @@ erofs_read_uio(struct vnode *vp, struct uio *uio)
 			return (z_erofs_read_pages(vp, uio));
 		return (z_erofs_read_uio(sbi, vi, uio));
 	}
+
+	buffered = buffered && vp->v_type == VREG &&
+	    uio->uio_segflg == UIO_USERSPACE &&
+	    sbi->read_buffer_size == 16384 && PAGE_SIZE == 4096 &&
+	    sbi->block_size == PAGE_SIZE && sbi->extra_devices == 0 &&
+	    !sbi->flatdev && sbi->dif0.source_kind == EROFS_SOURCE_BLOCK &&
+	    (vi->datalayout == EROFS_INODE_FLAT_PLAIN ||
+		vi->datalayout == EROFS_INODE_FLAT_INLINE);
+	demand_pair = buffered && 2 * PAGE_SIZE <= maxphys;
+	onebuf = buffered && uio->uio_rw == UIO_READ && uio->uio_iovcnt == 1 &&
+	    (curthread->td_pflags & TDP_UIOHELD) == 0 &&
+	    !erofs_nid_in_metabox(vi->nid) && (sbi->dif0.fsoff & PAGE_MASK) == 0;
 
 	/* Uncompressed file path */
 	while (uio->uio_resid > 0 && (uint64_t)uio->uio_offset < vi->size) {
@@ -970,18 +1168,31 @@ erofs_read_uio(struct vnode *vp, struct uio *uio)
 			}
 			continue;
 		}
+		if (mapoff > UINT64_MAX - map.m_pa)
+			return (EOVERFLOW);
+		physical = map.m_pa + mapoff;
+		if (onebuf && map.m_deviceid == 0 && physical <= INT64_MAX &&
+		    want <= PAGE_SIZE - (physical & PAGE_MASK) &&
+		    want <= uio->uio_iov->iov_len) {
+			error = erofs_read_onebuf(sbi, physical, want, uio);
+			if (error == 0)
+				continue;
+			if (error != EJUSTRETURN)
+				return (error);
+		}
 		if ((map.m_flags & EROFS_MAP_META) != 0) {
-			if (mapoff > UINT64_MAX - map.m_pa)
-				return (EOVERFLOW);
-			physical = map.m_pa + mapoff;
 			error = erofs_read_metadata_range(sbi, vi->nid,
 			    physical, want, &buf);
 		} else {
-			if (mapoff > UINT64_MAX - map.m_pa)
-				return (EOVERFLOW);
-			physical = map.m_pa + mapoff;
-			error = erofs_read_physical(sbi, map.m_deviceid,
-			    physical, want, &blk);
+			if (demand_pair && want == 2 * PAGE_SIZE &&
+			    map.m_flags == EROFS_MAP_MAPPED &&
+			    map.m_deviceid == 0 &&
+			    ((physical | sbi->dif0.fsoff) & PAGE_MASK) == 0)
+				error = erofs_read_demand_pair(sbi, physical,
+				    &blk);
+			else
+				error = erofs_read_physical(sbi, map.m_deviceid,
+				    physical, want, &blk);
 		}
 		if (error != 0)
 			return (error);
@@ -1074,7 +1285,7 @@ erofs_read_file(struct vnode *file_vnode, struct uio *uio, int ioflag)
 	/* The legacy vnode pager calls VOP_READ into an xbusy page. */
 	if (uio->uio_offset < 0 || (ioflag & IO_DIRECT) != 0 ||
 	    uio->uio_segflg == UIO_SYSSPACE)
-		return (erofs_read_uio(file_vnode, uio));
+		return (erofs_read_uio(file_vnode, uio, false));
 
 	bufsize = erofs_vmio_bufsize(file_vnode);
 	file_size = VTOE(file_vnode)->size;
@@ -1082,7 +1293,7 @@ erofs_read_file(struct vnode *file_vnode, struct uio *uio, int ioflag)
 		file_lbn = uio->uio_offset / bufsize;
 		error = erofs_vmio_map(file_vnode, file_lbn, &extent);
 		if (error == EOPNOTSUPP)
-			return (erofs_read_uio(file_vnode, uio));
+			return (erofs_read_uio(file_vnode, uio, true));
 		if (error != 0)
 			return (error);
 
@@ -1158,5 +1369,5 @@ erofs_readlink_target(struct vnode *vp, struct uio *uio)
 	if (vi->size == 0)
 		return (
 		    erofs_corrupt(MTOE(vp->v_mount), vi->nid, "empty symlink"));
-	return (erofs_read_uio(vp, uio));
+	return (erofs_read_uio(vp, uio, false));
 }
